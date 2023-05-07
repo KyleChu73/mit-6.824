@@ -56,9 +56,10 @@ func init() {
 }
 
 type NotifyTaskCompleteArgs struct {
+	Task               interface{}
 	WorkerName         string
 	WorkerApplyTaskSeq int
-	IntermediateFiles  []string
+	OutputFiles  []string
 }
 
 type NotifyTaskCompleteReply struct {

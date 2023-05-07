@@ -10,6 +10,12 @@ import (
 	"sync"
 )
 
+const (
+	IDLE int = iota
+	IN_PROGRESS
+	COMPLETE
+)
+
 type Coordinator struct {
 	// Your definitions here.
 	mu                  sync.Mutex
@@ -17,6 +23,7 @@ type Coordinator struct {
 	InputFiles          []string
 	ReduceTaskNum       int
 	WorkerTaskApplySeqs map[string]int
+	MapTaskStatus       map[string]int
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -40,6 +47,7 @@ func (c *Coordinator) ApplyTask(args *ApplyTaskArgs, reply *ApplyTaskReply) erro
 		reply.Task = MapTask{MapFileName: c.InputFiles[1], ReduceTaskNum: c.ReduceTaskNum}
 	}
 
+	reply.WorkerApplyTaskSeq = c.WorkerTaskApplySeqs[args.WorkerName]
 	c.WorkerTaskApplySeqs[args.WorkerName]++
 
 	c.TotalTaskAllocated++
@@ -51,8 +59,19 @@ func (c *Coordinator) NotifyTaskComplete(args *NotifyTaskCompleteArgs, reply *No
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	fmt.Printf("task complete!\n\t worker: %v\n\t worker apply task sequence: %v\n\t files: %v\n\n",
-		args.WorkerName, args.WorkerApplyTaskSeq, args.IntermediateFiles)
+	info := fmt.Sprintf("worker: %v\n\t worker apply task sequence: %v\n\t output files: %v\n\n",
+		args.WorkerName, args.WorkerApplyTaskSeq, args.OutputFiles)
+
+	switch task := args.Task.(type) {
+	case MapTask:
+		fmt.Printf("map-%v complete!\n\t %v", task.MapFileName, info)
+	case ReduceTask:
+		fmt.Printf("reduce-%v complete!\n\t %v", task.ReduceTaskIdx, info)
+	case NoneTask:
+		fmt.Println("worker complete none task (then it will exit...)")
+	default:
+		log.Fatalln("NotifyTaskComplete(): invalid type!")
+	}
 
 	return nil
 }
@@ -98,10 +117,18 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// Your code here.
 
 	c.TotalTaskAllocated = 0
+
 	c.InputFiles = make([]string, len(files))
 	copy(c.InputFiles, files)
+
 	c.ReduceTaskNum = nReduce
+
 	c.WorkerTaskApplySeqs = make(map[string]int)
+
+	c.MapTaskStatus = make(map[string]int)
+	for _, f := range files {
+		c.MapTaskStatus[f] = IDLE
+	}
 
 	c.server()
 	return &c

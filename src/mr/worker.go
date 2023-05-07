@@ -104,9 +104,12 @@ loop:
 					fmt.Println("received a map task")
 					intermediate := doMapTask(mapf, &task)
 					files := writeIntermediateFiles(intermediate, task.MapFileName, task.ReduceTaskNum)
+					
 					// 将产生的临时文件告知 coordinator
-					cmpArgs := NotifyTaskCompleteArgs{WorkerName: workerName, WorkerApplyTaskSeq: reply.WorkerApplyTaskSeq,
-						IntermediateFiles: files}
+					cmpArgs := NotifyTaskCompleteArgs{
+						Task: task,
+						WorkerName: workerName, WorkerApplyTaskSeq: reply.WorkerApplyTaskSeq,
+						OutputFiles: files}
 					cmpReply := NotifyTaskCompleteReply{}
 					ok := call("Coordinator.NotifyTaskComplete", &cmpArgs, &cmpReply)
 					if !ok {
