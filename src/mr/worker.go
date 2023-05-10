@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
+	"strconv"
 	"time"
 )
 
@@ -77,8 +79,59 @@ func writeIntermediateFiles(kva []KeyValue, maptask string, nReduce int) []strin
 	return tmpfiles
 }
 
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 func doReduceTask(reducef func(string, []string) string, task *ReduceTask) string {
-	return ""
+	intermediate := []KeyValue{}
+	files := task.IntermediateFiles
+	for _, fName := range files {
+		file, err := os.Open(fName)
+		if err != nil {
+			log.Fatalln("doReduceTask(): cannot open file", err)
+		}
+		defer file.Close()
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+	}
+	sort.Sort(ByKey(intermediate))
+	oname := "mr-out-" + strconv.Itoa(task.ReduceTaskID)
+	ofile, err := os.Create(oname)
+	if err != nil {
+		log.Fatalln("Error: create file", err)
+	}
+	defer ofile.Close()
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	return ofile.Name()
 }
 
 // main/mrworker.go calls this function.
@@ -95,20 +148,20 @@ loop:
 		reply := ApplyTaskReply{}
 		ok := call("Coordinator.ApplyTask", &args, &reply)
 		if ok {
-			if reply.WorkerApplyTaskSeq >= latestTaskSeq {
+			if reply.WorkerApplySeq >= latestTaskSeq {
 				// 永远做最新的工作
-				latestTaskSeq = reply.WorkerApplyTaskSeq
+				latestTaskSeq = reply.WorkerApplySeq
 
 				switch task := reply.Task.(type) {
 				case MapTask:
 					fmt.Printf("received map-%v\n", task.MapFileName)
 					fmt.Println("debug sleeping")
-					time.Sleep(5 * time.Second)
+					time.Sleep(2 * time.Second)
 					intermediate := doMapTask(mapf, &task)
 					files := writeIntermediateFiles(intermediate, task.MapFileName, task.NReduce)
 					fmt.Printf("map-%v done, notifying coordinator", task.MapFileName)
 					// 将产生的临时文件告知 coordinator
-					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplyTaskSeq, files)
+					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplySeq, files)
 					if !ok {
 						fmt.Printf("map task %v completed by %v, but failed to notify coordinator\n", task.MapFileName, workerName)
 					} else {
@@ -117,10 +170,20 @@ loop:
 
 				case ReduceTask:
 					fmt.Println("received a reduce task")
+					fmt.Println("debug sleeping")
+					time.Sleep(2 * time.Second)
+					file := doReduceTask(reducef, &task)
+					fmt.Printf("reduce-%v done, notifying coordinator", task.ReduceTaskID)
+					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplySeq, []string{file})
+					if !ok {
+						fmt.Printf("reduce task %v completed by %v, but failed to notify coordinator\n", task.ReduceTaskID, workerName)
+					} else {
+						fmt.Printf("reduce task %v completed by %v, notified coordinator\n", task.ReduceTaskID, workerName)
+					}
 
 				case NoneTask:
 					fmt.Println("received none task")
-					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplyTaskSeq, []string{})
+					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplySeq, []string{})
 					if !ok {
 						fmt.Printf("%v received none task, but failed to notify coordinator, exiting...\n", workerName)
 					} else {
@@ -153,10 +216,11 @@ loop:
 
 func CallNotifyTaskComplete(task interface{}, taskAllocSeq int, workerName string, workerApplyTaskSeq int, files []string) bool {
 	cmpArgs := NotifyTaskCompleteArgs{
-		Task:       task,
-		WorkerName: workerName, WorkerApplyTaskSeq: workerApplyTaskSeq,
-		OutputFiles: files,
-		TaskAllocSeq: taskAllocSeq,
+		Task:               task,
+		WorkerName:         workerName,
+		WorkerApplyTaskSeq: workerApplyTaskSeq,
+		OutputFiles:        files,
+		TaskAllocSeq:       taskAllocSeq,
 	}
 	cmpReply := NotifyTaskCompleteReply{}
 	ok := call("Coordinator.NotifyTaskComplete", &cmpArgs, &cmpReply)

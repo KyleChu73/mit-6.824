@@ -9,6 +9,8 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -37,11 +39,11 @@ func (st StatusType) String() string {
 type TaskStatus struct {
 	Status     StatusType
 	LastestSeq int // 最新发出的任务的序号，-1 标识还没派发过这个任务
-	waiterChan chan *NotifyTaskCompleteArgs
+	waiterChan chan int
 }
 
 func NewTaskStatus() *TaskStatus {
-	return &TaskStatus{Status: StatusType(IDLE), LastestSeq: -1, waiterChan: make(chan *NotifyTaskCompleteArgs)}
+	return &TaskStatus{Status: StatusType(IDLE), LastestSeq: -1, waiterChan: make(chan int)}
 }
 
 // 不用 channel 是因为我需要一个无界的东西
@@ -89,13 +91,13 @@ type Coordinator struct {
 	MapTaskStatus       map[string]*TaskStatus
 	ReduceTaskStatus    map[int]*TaskStatus
 
-	MapLeft    int // 剩余 map 任务数量
-	ReduceLeft int // 剩余 reduce 任务数量
+	MapGroup sync.WaitGroup
 
-	MapLatch    *sync.Cond // 有个go程在等待这个条件变量，然后放入 reduce 任务
-	ReduceLatch *sync.Cond // 有个go程在等待这个条件变量，然后终止 coordinator
+	ReduceGroup sync.WaitGroup
 
 	taskQue *TaskQueue
+
+	pendingReduceFiles map[int][]string // reduce 任务的输入
 
 	quit chan int
 }
@@ -110,6 +112,13 @@ func timeUpNotifier() chan int {
 	return ch
 }
 
+// helper，无锁
+func resetTaskStatus(taskStatus *TaskStatus) int {
+	taskStatus.LastestSeq++
+	taskStatus.Status = StatusType(IN_PROGRESS)
+	return taskStatus.LastestSeq
+}
+
 // Your code here -- RPC handlers for the worker to call.
 // 客户端通过 rpc 调用这个方法，这个方法在服务端执行
 func (c *Coordinator) ApplyTask(args *ApplyTaskArgs, reply *ApplyTaskReply) error {
@@ -118,28 +127,30 @@ func (c *Coordinator) ApplyTask(args *ApplyTaskArgs, reply *ApplyTaskReply) erro
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	switch task := task.(type) {
-	case MapTask:
-		taskStatus := c.MapTaskStatus[task.MapFileName]
-		taskStatus.LastestSeq++
-		taskStatus.Status = StatusType(IN_PROGRESS)
-		reply.TaskAllocSeq = taskStatus.LastestSeq
-		go c.taskWaiter(task, taskStatus.waiterChan, timeUpNotifier())
-		fmt.Printf("%v applied: map-%v TaskAllocSeq:%v WorkerApplyTaskSeq:%v\n", args.WorkerName, task.MapFileName, reply.TaskAllocSeq, reply.WorkerApplyTaskSeq)
-
-	case ReduceTask:
-		taskStatus := c.ReduceTaskStatus[task.ReduceTaskID]
-		taskStatus.LastestSeq++
-		taskStatus.Status = StatusType(IN_PROGRESS)
-		reply.TaskAllocSeq = taskStatus.LastestSeq
-		go c.taskWaiter(task, taskStatus.waiterChan, timeUpNotifier())
-	}
-	reply.Task = task
-
-	reply.WorkerApplyTaskSeq = c.WorkerTaskApplySeqs[args.WorkerName]
+	reply.WorkerApplySeq = c.WorkerTaskApplySeqs[args.WorkerName]
 	c.WorkerTaskApplySeqs[args.WorkerName]++
 
 	c.TotalTaskAllocated++
+
+	switch task := task.(type) {
+	case MapTask:
+		taskStatus := c.MapTaskStatus[task.MapFileName]
+		reply.TaskAllocSeq = resetTaskStatus(taskStatus)
+		go c.taskWaiter(task, taskStatus.waiterChan, timeUpNotifier())
+		fmt.Printf("%v applied: map-%v TaskAllocSeq:%v WorkerApplySeq:%v\n", args.WorkerName, task.MapFileName, reply.TaskAllocSeq, reply.WorkerApplySeq)
+
+	case ReduceTask:
+		taskStatus := c.ReduceTaskStatus[task.ReduceTaskID]
+		reply.TaskAllocSeq = resetTaskStatus(taskStatus)
+		go c.taskWaiter(task, taskStatus.waiterChan, timeUpNotifier())
+		fmt.Printf("%v applied: reduce-%v TaskAllocSeq:%v WorkerApplySeq:%v\n", args.WorkerName, task.ReduceTaskID, reply.TaskAllocSeq, reply.WorkerApplySeq)
+
+	case NoneTask:
+		reply.TaskAllocSeq = c.TotalTaskAllocated
+		fmt.Printf("%v applied: none TaskAllocSeq:%v WorkerApplySeq:%v\n", args.WorkerName, reply.TaskAllocSeq, reply.WorkerApplySeq)
+	}
+
+	reply.Task = task
 
 	return nil
 }
@@ -147,34 +158,83 @@ func (c *Coordinator) ApplyTask(args *ApplyTaskArgs, reply *ApplyTaskReply) erro
 // 分配一个任务之后应该等待回复，十秒没收到回复则重新把这个任务加入队列
 // TODO 任务完成的时候，好像只要让它退出就行。。
 // 其他的放到 NotifyTaskComplete 里
-func (c *Coordinator) taskWaiter(task interface{}, waiterChan chan *NotifyTaskCompleteArgs, timeUp chan int) {
-	var args *NotifyTaskCompleteArgs
-
+func (c *Coordinator) taskWaiter(task interface{}, waiterChan chan int, timeUp chan int) {
 	select {
-	case args = <-waiterChan:
-		switch task := args.Task.(type) {
+	case <-waiterChan:
+		switch task := task.(type) {
 		case MapTask: // 完成了一个 map 任务
 			fmt.Printf("map-%v taskwaiter exiting...\n", task.MapFileName)
 
 		case ReduceTask:
-			// fmt.Printf("reduce-%v complete!\n\t %v", task.ReduceTaskIdx, info)
-
-		case NoneTask:
-			fmt.Println("worker complete none task (then it will exit...)")
+			fmt.Printf("reduce-%v taskwaiter exiting...\n", task.ReduceTaskID)
 
 		default:
-			log.Fatalln("NotifyTaskComplete(): invalid type!")
+			log.Fatalln("taskWaiter(): invalid type!")
 		}
 
 	case <-timeUp:
-		c.taskQue.Add(task)
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		switch task := task.(type) {
-		case MapTask:
-			c.MapTaskStatus[task.MapFileName].LastestSeq++
-			c.MapTaskStatus[task.MapFileName].Status = StatusType(IDLE)
-			fmt.Printf("****warning: reput map-%v\n", task.MapFileName)
+		c.reputTask(task)
+	}
+
+}
+
+func (c *Coordinator) reputTask(task interface{}) {
+	c.taskQue.Add(task)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch task := task.(type) {
+	case MapTask:
+		c.MapTaskStatus[task.MapFileName].LastestSeq++
+		c.MapTaskStatus[task.MapFileName].Status = StatusType(IDLE)
+		fmt.Printf("****warning: reput map-%v\n", task.MapFileName)
+	}
+}
+
+func (c *Coordinator) fmtStatus(which int) []string {
+	allStatus := []string{}
+	switch which {
+	case MAP:
+		for k, v := range c.MapTaskStatus {
+			allStatus = append(allStatus, fmt.Sprintf("%v:%v, ", k, v.Status))
+		}
+	case REDUCE:
+		for k, v := range c.ReduceTaskStatus {
+			allStatus = append(allStatus, fmt.Sprintf("%v:%v, ", k, v.Status))
+		}
+	}
+	sort.StringSlice(allStatus).Sort()
+	return allStatus
+}
+
+func removeFiles(files []string) {
+	for _, file := range files {
+		err := os.Remove(file)
+		if err != nil {
+			log.Fatalln(err)
+		}
+	}
+}
+
+// 输入是一个map任务产生的临时中间文件
+// 将临时文件名字末尾的随机数去除，并记录下新的文件名
+func (c *Coordinator) finalizeMap(mapOutFiles []string) {
+	for _, oldName := range mapOutFiles {
+		idx := strings.LastIndex(oldName, "-")
+		if idx != -1 {
+			newName := oldName[:idx] // 去除末尾的随机数
+			err := os.Rename(oldName, newName)
+			if err != nil {
+				log.Fatalln("Error renaming file:", err)
+			}
+			parts := strings.Split(newName, "-")
+			if len(parts) >= 1 {
+				numStr := parts[len(parts)-1]
+				num, err := strconv.Atoi(numStr)
+				if err != nil {
+					log.Fatalln("Error Atoi:", err)
+				}
+				c.pendingReduceFiles[num] = append(c.pendingReduceFiles[num], newName)
+			}
 		}
 	}
 
@@ -194,7 +254,7 @@ func (c *Coordinator) NotifyTaskComplete(args *NotifyTaskCompleteArgs, reply *No
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var ch chan *NotifyTaskCompleteArgs
+	var ch chan int
 	switch task := args.Task.(type) {
 	case MapTask:
 		mapName := task.MapFileName
@@ -204,30 +264,51 @@ func (c *Coordinator) NotifyTaskComplete(args *NotifyTaskCompleteArgs, reply *No
 		// 如果taskWaiter已经重放任务并退出，那么它一定会更新LastestSeq（旧的TaskAllocSeq也就无法与之一致）
 		if args.TaskAllocSeq == latestSeq {
 			fmt.Printf("map-%v complete! \n\t task info: \n\t %v", task.MapFileName, info)
-			ch <- args // 唤醒 task 对应的 taskWaiter
+			ch <- 1 // 唤醒 task 对应的 taskWaiter
+			c.finalizeMap(args.OutputFiles)
 			c.MapTaskStatus[task.MapFileName].Status = StatusType(COMPLETE)
-			c.MapLeft--
-			if c.MapLeft <= 0 {
-				c.MapLatch.Broadcast()
-			}
-
-			fmt.Printf("map task left: %v\n", c.MapLeft)
-			allStatus := []string{}
-			for k, v := range c.MapTaskStatus {
-				allStatus = append(allStatus, fmt.Sprintf("%v:%v, ", k, v.Status))
-			}
-			sort.StringSlice(allStatus).Sort()
+			c.MapGroup.Done()
+			// fmt.Printf("map task left: %v\n")
+			allStatus := c.fmtStatus(MAP)
 			fmt.Printf("\t%v\n\n", allStatus)
 		} else {
 			fmt.Printf("map-%v complete, but out of date, latest seq: %v \n\t task info: \n\t %v", task.MapFileName, latestSeq, info)
+			removeFiles(args.OutputFiles)
 		}
 
 	case ReduceTask:
-		// reduceId := task.ReduceTaskIdx
-		// ch = c.ReduceTaskStatus[reduceId].waiterChan
+		reduceId := task.ReduceTaskID
+		ch = c.ReduceTaskStatus[reduceId].waiterChan
+		latestSeq := c.ReduceTaskStatus[task.ReduceTaskID].LastestSeq
+		if args.TaskAllocSeq == latestSeq {
+			fmt.Printf("reduce-%v complete! \n\t task info: \n\t %v", task.ReduceTaskID, info)
+			ch <- 1 // 唤醒 task 对应的 taskWaiter
+			c.ReduceTaskStatus[task.ReduceTaskID].Status = StatusType(COMPLETE)
+			c.ReduceGroup.Done()
+			// fmt.Printf("reduce task left: %v\n", c.ReduceLeft)
+			allStatus := c.fmtStatus(REDUCE)
+			fmt.Printf("\t%v\n\n", allStatus)
+		} else {
+			fmt.Printf("reduce-%v complete, but out of date, latest seq: %v \n\t task info: \n\t %v", task.ReduceTaskID, latestSeq, info)
+			removeFiles(args.OutputFiles)
+		}
+
+	case NoneTask:
+		fmt.Printf("worker exit... \n\t info: \n\t %v", info)
 	}
 
 	return nil
+}
+
+func (c *Coordinator) copyReduceFiles() map[int][]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	reduceFiles := map[int][]string{}
+	for k, v := range c.pendingReduceFiles {
+		reduceFiles[k] = make([]string, len(v))
+		copy(reduceFiles[k], v)
+	}
+	return reduceFiles
 }
 
 // an example RPC handler.
@@ -259,6 +340,11 @@ func (c *Coordinator) Done() bool {
 
 	// Your code here.
 	<-c.quit
+	reduceFiles := c.copyReduceFiles()
+	fmt.Println("removing intermediate files...")
+	for _, files := range reduceFiles {
+		removeFiles(files)
+	}
 	return true
 
 	return ret
@@ -294,42 +380,41 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		c.ReduceTaskStatus[i] = NewTaskStatus()
 	}
 
-	c.MapLeft = len(files)
-	c.ReduceLeft = nReduce
-
-	c.MapLatch = sync.NewCond(c.mu)
-	c.ReduceLatch = sync.NewCond(c.mu)
-
 	c.taskQue = NewTaskQueue()
 	for _, file := range c.InputFiles {
 		c.taskQue.Add(MapTask{file, nReduce})
 	}
 
+	c.pendingReduceFiles = make(map[int][]string)
+	for i := 0; i < nReduce; i++ {
+		c.pendingReduceFiles[i] = make([]string, 0)
+	}
+
 	c.quit = make(chan int)
 
+	c.MapGroup.Add(len(c.InputFiles))
 	// 等待所有 map 完成，然后放入 reduce 任务
 	go func(c *Coordinator) {
-		c.mu.Lock()
-		for c.MapLeft > 0 {
-			c.MapLatch.Wait()
-		}
-		c.mu.Unlock()
-		fmt.Println("all map task done")
-		// TODO DEBUG
-		fmt.Println("all task done")
+		c.MapGroup.Wait()
+
+		reduceFiles := c.copyReduceFiles()
+
+		fmt.Println("all map task done, putting reduce tasks")
 		for i := 0; i < nReduce; i++ {
-			c.taskQue.Add(ReduceTask{i})
+			c.taskQue.Add(ReduceTask{i, reduceFiles[i]})
 		}
 	}(&c)
 
+	c.ReduceGroup.Add(nReduce)
+
 	go func(c *Coordinator) {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		for c.ReduceLeft > 0 {
-			c.ReduceLatch.Wait()
-		}
+		c.ReduceGroup.Wait()
 		fmt.Println("all task done")
-		os.Exit(0)
+		for i := 0; i < nReduce; i++ {
+			c.taskQue.Add(NoneTask{})
+		}
+		fmt.Println("Coordinator will exit in 10 seconds...")
+		c.quit <- 1
 	}(&c)
 
 	c.server()
