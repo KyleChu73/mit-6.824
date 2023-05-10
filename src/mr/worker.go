@@ -59,7 +59,7 @@ func writeIntermediateFiles(kva []KeyValue, maptask string, nReduce int) []strin
 	for reduceIdx, kva := range kvtable {
 		f, err := ioutil.TempFile("/home/kyle/6.824/tmp", fmt.Sprintf("mr-%v-%v-*", maptask, reduceIdx))
 		if err != nil {
-			log.Fatalln("writeIntermediateFiles(): cannot create tmp file")
+			log.Fatalln("writeIntermediateFiles(): cannot create tmp file", err)
 		}
 		defer f.Close()
 
@@ -101,17 +101,14 @@ loop:
 
 				switch task := reply.Task.(type) {
 				case MapTask:
-					fmt.Println("received a map task")
+					fmt.Printf("received map-%v\n", task.MapFileName)
+					fmt.Println("debug sleeping")
+					time.Sleep(5 * time.Second)
 					intermediate := doMapTask(mapf, &task)
-					files := writeIntermediateFiles(intermediate, task.MapFileName, task.ReduceTaskNum)
-					
+					files := writeIntermediateFiles(intermediate, task.MapFileName, task.NReduce)
+					fmt.Printf("map-%v done, notifying coordinator", task.MapFileName)
 					// 将产生的临时文件告知 coordinator
-					cmpArgs := NotifyTaskCompleteArgs{
-						Task: task,
-						WorkerName: workerName, WorkerApplyTaskSeq: reply.WorkerApplyTaskSeq,
-						OutputFiles: files}
-					cmpReply := NotifyTaskCompleteReply{}
-					ok := call("Coordinator.NotifyTaskComplete", &cmpArgs, &cmpReply)
+					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplyTaskSeq, files)
 					if !ok {
 						fmt.Printf("map task %v completed by %v, but failed to notify coordinator\n", task.MapFileName, workerName)
 					} else {
@@ -123,6 +120,12 @@ loop:
 
 				case NoneTask:
 					fmt.Println("received none task")
+					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplyTaskSeq, []string{})
+					if !ok {
+						fmt.Printf("%v received none task, but failed to notify coordinator, exiting...\n", workerName)
+					} else {
+						fmt.Printf("%v received none task, notified coordinator, exiting...\n", workerName)
+					}
 					break loop
 
 				default:
@@ -146,6 +149,18 @@ loop:
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+}
+
+func CallNotifyTaskComplete(task interface{}, taskAllocSeq int, workerName string, workerApplyTaskSeq int, files []string) bool {
+	cmpArgs := NotifyTaskCompleteArgs{
+		Task:       task,
+		WorkerName: workerName, WorkerApplyTaskSeq: workerApplyTaskSeq,
+		OutputFiles: files,
+		TaskAllocSeq: taskAllocSeq,
+	}
+	cmpReply := NotifyTaskCompleteReply{}
+	ok := call("Coordinator.NotifyTaskComplete", &cmpArgs, &cmpReply)
+	return ok
 }
 
 // example function to show how to make an RPC call to the coordinator.

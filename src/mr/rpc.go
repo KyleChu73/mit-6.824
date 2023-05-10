@@ -32,13 +32,12 @@ type ApplyTaskArgs struct {
 }
 
 type MapTask struct {
-	MapFileName   string // 唯一标识了一个 map 任务
-	ReduceTaskNum int    // 共有多少个 reduce task，用于哈希
+	MapFileName string // 唯一标识了一个 map 任务
+	NReduce     int    // 共有多少个 reduce task，用于哈希
 }
 
 type ReduceTask struct {
-	ReduceTaskIdx int // 唯一标识了一个 reduce 任务
-
+	ReduceTaskID int // 唯一标识了一个 reduce 任务
 }
 
 type NoneTask struct {
@@ -47,6 +46,7 @@ type NoneTask struct {
 type ApplyTaskReply struct {
 	WorkerApplyTaskSeq int // 每个 Worker 有一个任务号
 	Task               interface{}
+	TaskAllocSeq       int // 这个任务第几次分配
 }
 
 func init() {
@@ -57,9 +57,10 @@ func init() {
 
 type NotifyTaskCompleteArgs struct {
 	Task               interface{}
+	TaskAllocSeq       int
 	WorkerName         string
 	WorkerApplyTaskSeq int
-	OutputFiles  []string
+	OutputFiles        []string
 }
 
 type NotifyTaskCompleteReply struct {
