@@ -54,6 +54,8 @@ func init() {
 	gob.Register(MapTask{})
 	gob.Register(ReduceTask{})
 	gob.Register(NoneTask{})
+
+	// log.SetOutput(ioutil.Discard)	// 为了更好的看测试结果
 }
 
 const (

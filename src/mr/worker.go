@@ -155,40 +155,40 @@ loop:
 
 				switch task := reply.Task.(type) {
 				case MapTask:
-					fmt.Printf("received map-%v\n", task.MapFileName)
-					// fmt.Println("debug sleeping")
+					log.Printf("received map-%v\n", task.MapFileName)
+					// log.Println("debug sleeping")
 					// time.Sleep(2 * time.Second)
 					intermediate := doMapTask(mapf, &task)
 					files := writeIntermediateFiles(intermediate, task.MapFileName, task.NReduce)
-					fmt.Printf("map-%v done, notifying coordinator", task.MapFileName)
+					log.Printf("map-%v done, notifying coordinator", task.MapFileName)
 					// 将产生的临时文件告知 coordinator
 					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplySeq, files)
 					if !ok {
-						fmt.Printf("map task %v completed by %v, but failed to notify coordinator\n", task.MapFileName, workerName)
+						log.Printf("map task %v completed by %v, but failed to notify coordinator\n", task.MapFileName, workerName)
 					} else {
-						fmt.Printf("map task %v completed by %v, notified coordinator\n", task.MapFileName, workerName)
+						log.Printf("map task %v completed by %v, notified coordinator\n", task.MapFileName, workerName)
 					}
 
 				case ReduceTask:
-					fmt.Println("received a reduce task")
-					// fmt.Println("debug sleeping")
+					log.Println("received a reduce task")
+					// log.Println("debug sleeping")
 					// time.Sleep(2 * time.Second)
 					file := doReduceTask(reducef, &task)
-					fmt.Printf("reduce-%v done, notifying coordinator", task.ReduceTaskID)
+					log.Printf("reduce-%v done, notifying coordinator", task.ReduceTaskID)
 					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplySeq, []string{file})
 					if !ok {
-						fmt.Printf("reduce task %v completed by %v, but failed to notify coordinator\n", task.ReduceTaskID, workerName)
+						log.Printf("reduce task %v completed by %v, but failed to notify coordinator\n", task.ReduceTaskID, workerName)
 					} else {
-						fmt.Printf("reduce task %v completed by %v, notified coordinator\n", task.ReduceTaskID, workerName)
+						log.Printf("reduce task %v completed by %v, notified coordinator\n", task.ReduceTaskID, workerName)
 					}
 
 				case NoneTask:
-					fmt.Println("received none task")
+					log.Println("received none task")
 					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplySeq, []string{})
 					if !ok {
-						fmt.Printf("%v received none task, but failed to notify coordinator, exiting...\n", workerName)
+						log.Printf("%v received none task, but failed to notify coordinator, exiting...\n", workerName)
 					} else {
-						fmt.Printf("%v received none task, notified coordinator, exiting...\n", workerName)
+						log.Printf("%v received none task, notified coordinator, exiting...\n", workerName)
 					}
 					break loop
 
@@ -198,13 +198,13 @@ loop:
 				}
 			} else {
 				// 这个任务过时了
-				fmt.Println("received a old task, ignore")
+				log.Println("received a old task, ignore")
 			}
 
 		} else {
 			// 也许网络波动，rpc 失败了……
 			// TODO：防止无限循环
-			fmt.Printf("call failed!\n")
+			log.Printf("call failed!\n")
 		}
 
 		time.Sleep(time.Second) // 这个循环不要过于频繁
