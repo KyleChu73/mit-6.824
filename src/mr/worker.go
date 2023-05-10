@@ -155,18 +155,18 @@ loop:
 
 				switch task := reply.Task.(type) {
 				case MapTask:
-					log.Printf("received map-%v\n", task.MapFileName)
+					log.Printf("received map-%v\n", path.Base(task.MapFileName))
 					// log.Println("debug sleeping")
 					// time.Sleep(2 * time.Second)
 					intermediate := doMapTask(mapf, &task)
 					files := writeIntermediateFiles(intermediate, task.MapFileName, task.NReduce)
-					log.Printf("map-%v done, notifying coordinator", task.MapFileName)
+					log.Printf("map-%v done, notifying coordinator", path.Base(task.MapFileName))
 					// 将产生的临时文件告知 coordinator
 					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplySeq, files)
 					if !ok {
-						log.Printf("map task %v completed by %v, but failed to notify coordinator\n", task.MapFileName, workerName)
+						log.Printf("map task %v completed by %v, but failed to notify coordinator\n", path.Base(task.MapFileName), workerName)
 					} else {
-						log.Printf("map task %v completed by %v, notified coordinator\n", task.MapFileName, workerName)
+						log.Printf("map task %v completed by %v, notified coordinator\n", path.Base(task.MapFileName), workerName)
 					}
 
 				case ReduceTask:
@@ -207,7 +207,7 @@ loop:
 			log.Printf("call failed!\n")
 		}
 
-		time.Sleep(time.Second) // 这个循环不要过于频繁
+		time.Sleep(time.Second / 10) // 这个循环不要过于频繁
 	}
 
 	// uncomment to send the Example RPC to the coordinator.

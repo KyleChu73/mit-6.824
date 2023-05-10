@@ -137,7 +137,7 @@ func (c *Coordinator) ApplyTask(args *ApplyTaskArgs, reply *ApplyTaskReply) erro
 		taskStatus := c.MapTaskStatus[task.MapFileName]
 		reply.TaskAllocSeq = resetTaskStatus(taskStatus)
 		go c.taskWaiter(task, taskStatus.waiterChan, timeUpNotifier())
-		log.Printf("%v applied: map-%v TaskAllocSeq:%v WorkerApplySeq:%v\n", args.WorkerName, task.MapFileName, reply.TaskAllocSeq, reply.WorkerApplySeq)
+		log.Printf("%v applied: map-%v TaskAllocSeq:%v WorkerApplySeq:%v\n", args.WorkerName, path.Base(task.MapFileName), reply.TaskAllocSeq, reply.WorkerApplySeq)
 
 	case ReduceTask:
 		taskStatus := c.ReduceTaskStatus[task.ReduceTaskID]
@@ -163,7 +163,7 @@ func (c *Coordinator) taskWaiter(task interface{}, waiterChan chan int, timeUp c
 	case <-waiterChan:
 		switch task := task.(type) {
 		case MapTask: // 完成了一个 map 任务
-			log.Printf("map-%v taskwaiter exiting...\n", task.MapFileName)
+			log.Printf("map-%v taskwaiter exiting...\n", path.Base(task.MapFileName))
 
 		case ReduceTask:
 			log.Printf("reduce-%v taskwaiter exiting...\n", task.ReduceTaskID)
@@ -186,7 +186,7 @@ func (c *Coordinator) reputTask(task interface{}) {
 	case MapTask:
 		c.MapTaskStatus[task.MapFileName].LastestSeq++
 		c.MapTaskStatus[task.MapFileName].Status = StatusType(IDLE)
-		log.Printf("****warning: reput map-%v\n", task.MapFileName)
+		log.Printf("****warning: reput map-%v\n", path.Base(task.MapFileName))
 	}
 }
 
@@ -195,7 +195,7 @@ func (c *Coordinator) fmtStatus(which int) []string {
 	switch which {
 	case MAP:
 		for k, v := range c.MapTaskStatus {
-			allStatus = append(allStatus, fmt.Sprintf("%v:%v, ", k, v.Status))
+			allStatus = append(allStatus, fmt.Sprintf("%v:%v, ", path.Base(k), v.Status))
 		}
 	case REDUCE:
 		for k, v := range c.ReduceTaskStatus {
@@ -248,7 +248,7 @@ func (c *Coordinator) NotifyTaskComplete(args *NotifyTaskCompleteArgs, reply *No
 	for _, file := range files {
 		fileInfo = append(fileInfo, path.Base(file))
 	}
-	info := fmt.Sprintf("task alloc seq: %v\n\t worker: %v\n\t worker apply task sequence: %v\n\t output files: %v\n",
+	info := fmt.Sprintf("task alloc seq: %v\n\t\t\t worker: %v\n\t\t\t worker apply task sequence: %v\n\t\t\t output files: %v",
 		args.TaskAllocSeq, args.WorkerName, args.WorkerApplyTaskSeq, fileInfo)
 
 	c.mu.Lock()
@@ -263,16 +263,15 @@ func (c *Coordinator) NotifyTaskComplete(args *NotifyTaskCompleteArgs, reply *No
 		// 只要TaskAllocSeq等于LastestSeq，那么taskWaiter一定活着
 		// 如果taskWaiter已经重放任务并退出，那么它一定会更新LastestSeq（旧的TaskAllocSeq也就无法与之一致）
 		if args.TaskAllocSeq == latestSeq {
-			log.Printf("map-%v complete! \n\t task info: \n\t %v", task.MapFileName, info)
 			ch <- 1 // 唤醒 task 对应的 taskWaiter
 			c.finalizeMap(args.OutputFiles)
 			c.MapTaskStatus[task.MapFileName].Status = StatusType(COMPLETE)
 			c.MapGroup.Done()
 			// log.Printf("map task left: %v\n")
 			allStatus := c.fmtStatus(MAP)
-			log.Printf("\t%v\n\n", allStatus)
+			log.Printf("map-%v complete! \n\t\t\t task info: \n\t\t\t %v\n\t\t\t %v\n", path.Base(task.MapFileName), info, allStatus)
 		} else {
-			log.Printf("map-%v complete, but out of date, latest seq: %v \n\t task info: \n\t %v", task.MapFileName, latestSeq, info)
+			log.Printf("map-%v complete, but out of date, latest seq: %v \n\t\t\t task info: \n\t\t\t %v", path.Base(task.MapFileName), latestSeq, info)
 			removeFiles(args.OutputFiles)
 		}
 
@@ -281,20 +280,19 @@ func (c *Coordinator) NotifyTaskComplete(args *NotifyTaskCompleteArgs, reply *No
 		ch = c.ReduceTaskStatus[reduceId].waiterChan
 		latestSeq := c.ReduceTaskStatus[task.ReduceTaskID].LastestSeq
 		if args.TaskAllocSeq == latestSeq {
-			log.Printf("reduce-%v complete! \n\t task info: \n\t %v", task.ReduceTaskID, info)
 			ch <- 1 // 唤醒 task 对应的 taskWaiter
 			c.ReduceTaskStatus[task.ReduceTaskID].Status = StatusType(COMPLETE)
 			c.ReduceGroup.Done()
 			// log.Printf("reduce task left: %v\n", c.ReduceLeft)
 			allStatus := c.fmtStatus(REDUCE)
-			log.Printf("\t%v\n\n", allStatus)
+			log.Printf("reduce-%v complete! \n\t\t\t task info: \n\t\t\t %v\n\t\t\t %v\n", task.ReduceTaskID, info, allStatus)
 		} else {
-			log.Printf("reduce-%v complete, but out of date, latest seq: %v \n\t task info: \n\t %v", task.ReduceTaskID, latestSeq, info)
+			log.Printf("reduce-%v complete, but out of date, latest seq: %v \n\t\t\t task info: \n\t\t\t %v", task.ReduceTaskID, latestSeq, info)
 			removeFiles(args.OutputFiles)
 		}
 
 	case NoneTask:
-		log.Printf("worker exit... \n\t info: \n\t %v", info)
+		log.Printf("worker replied none task exit... \n\t\t\t info: \n\t\t\t %v", info)
 	}
 
 	return nil
@@ -411,7 +409,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		for i := 0; i < nReduce; i++ {
 			c.taskQue.Add(NoneTask{})
 		}
-		log.Println("Coordinator will exit in 10 seconds...")
+		log.Printf("Coordinator will exit in 10 seconds...\n\n")
 		c.quit <- 1
 	}(&c)
 
