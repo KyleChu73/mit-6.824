@@ -362,9 +362,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.TotalTaskAllocated = 0
 
 	c.InputFiles = make([]string, 0)
-	for _, file := range files {
-		c.InputFiles = append(c.InputFiles, path.Base(file))
-	}
+	c.InputFiles = append(c.InputFiles, files...)
 
 	c.NumReduce = nReduce
 
@@ -381,7 +379,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	c.taskQue = NewTaskQueue()
-	for _, file := range c.InputFiles {
+	for _, file := range files {
 		c.taskQue.Add(MapTask{file, nReduce})
 	}
 

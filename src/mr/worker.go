@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path"
 	"sort"
 	"strconv"
 	"time"
@@ -59,7 +60,7 @@ func writeIntermediateFiles(kva []KeyValue, maptask string, nReduce int) []strin
 
 	tmpfiles := []string{}
 	for reduceIdx, kva := range kvtable {
-		f, err := ioutil.TempFile("/home/kyle/6.824/tmp", fmt.Sprintf("mr-%v-%v-*", maptask, reduceIdx))
+		f, err := ioutil.TempFile("/home/kyle/6.824/tmp", fmt.Sprintf("mr-%v-%v-*", path.Base(maptask), reduceIdx))
 		if err != nil {
 			log.Fatalln("writeIntermediateFiles(): cannot create tmp file", err)
 		}
@@ -155,8 +156,8 @@ loop:
 				switch task := reply.Task.(type) {
 				case MapTask:
 					fmt.Printf("received map-%v\n", task.MapFileName)
-					fmt.Println("debug sleeping")
-					time.Sleep(2 * time.Second)
+					// fmt.Println("debug sleeping")
+					// time.Sleep(2 * time.Second)
 					intermediate := doMapTask(mapf, &task)
 					files := writeIntermediateFiles(intermediate, task.MapFileName, task.NReduce)
 					fmt.Printf("map-%v done, notifying coordinator", task.MapFileName)
@@ -170,8 +171,8 @@ loop:
 
 				case ReduceTask:
 					fmt.Println("received a reduce task")
-					fmt.Println("debug sleeping")
-					time.Sleep(2 * time.Second)
+					// fmt.Println("debug sleeping")
+					// time.Sleep(2 * time.Second)
 					file := doReduceTask(reducef, &task)
 					fmt.Printf("reduce-%v done, notifying coordinator", task.ReduceTaskID)
 					ok := CallNotifyTaskComplete(task, reply.TaskAllocSeq, workerName, reply.WorkerApplySeq, []string{file})
