@@ -156,8 +156,6 @@ func (c *Coordinator) ApplyTask(args *ApplyTaskArgs, reply *ApplyTaskReply) erro
 }
 
 // 分配一个任务之后应该等待回复，十秒没收到回复则重新把这个任务加入队列
-// TODO 任务完成的时候，好像只要让它退出就行。。
-// 其他的放到 NotifyTaskComplete 里
 func (c *Coordinator) taskWaiter(task interface{}, waiterChan chan int, timeUp chan int) {
 	select {
 	case <-waiterChan:
