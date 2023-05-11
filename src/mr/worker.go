@@ -60,7 +60,7 @@ func writeIntermediateFiles(kva []KeyValue, maptask string, nReduce int) []strin
 
 	tmpfiles := []string{}
 	for reduceIdx, kva := range kvtable {
-		f, err := ioutil.TempFile("/home/kyle/6.824/tmp", fmt.Sprintf("mr-%v-%v-*", path.Base(maptask), reduceIdx))
+		f, err := ioutil.TempFile("", fmt.Sprintf("mr-%v-%v-*", path.Base(maptask), reduceIdx))
 		if err != nil {
 			log.Fatalln("writeIntermediateFiles(): cannot create tmp file", err)
 		}
@@ -203,7 +203,6 @@ loop:
 
 		} else {
 			// 也许网络波动，rpc 失败了……
-			// TODO：防止无限循环
 			log.Printf("call failed!\n")
 		}
 
