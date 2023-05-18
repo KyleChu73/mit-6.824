@@ -102,11 +102,16 @@ type Coordinator struct {
 	quit chan int
 }
 
-func timeUpNotifier() chan int {
+func timeUpNotifier(quit chan int) chan int {
 	ch := make(chan int)
 	// 返回一个channel，他会在10秒之后被写入
 	go func() {
 		time.Sleep(10 * time.Second)
+		select {
+		case <-quit:
+			return
+		default:
+		}
 		ch <- 1
 	}()
 	return ch
@@ -132,17 +137,19 @@ func (c *Coordinator) ApplyTask(args *ApplyTaskArgs, reply *ApplyTaskReply) erro
 
 	c.TotalTaskAllocated++
 
+	timerQuit := make(chan int)
+
 	switch task := task.(type) {
 	case MapTask:
 		taskStatus := c.MapTaskStatus[task.MapFileName]
 		reply.TaskAllocSeq = resetTaskStatus(taskStatus)
-		go c.taskWaiter(task, taskStatus.waiterChan, timeUpNotifier())
+		go c.taskWaiter(task, taskStatus.waiterChan, timeUpNotifier(timerQuit), timerQuit)
 		log.Printf("%v applied: map-%v TaskAllocSeq:%v WorkerApplySeq:%v\n", args.WorkerName, path.Base(task.MapFileName), reply.TaskAllocSeq, reply.WorkerApplySeq)
 
 	case ReduceTask:
 		taskStatus := c.ReduceTaskStatus[task.ReduceTaskID]
 		reply.TaskAllocSeq = resetTaskStatus(taskStatus)
-		go c.taskWaiter(task, taskStatus.waiterChan, timeUpNotifier())
+		go c.taskWaiter(task, taskStatus.waiterChan, timeUpNotifier(timerQuit), timerQuit)
 		log.Printf("%v applied: reduce-%v TaskAllocSeq:%v WorkerApplySeq:%v\n", args.WorkerName, task.ReduceTaskID, reply.TaskAllocSeq, reply.WorkerApplySeq)
 
 	case NoneTask:
@@ -156,7 +163,7 @@ func (c *Coordinator) ApplyTask(args *ApplyTaskArgs, reply *ApplyTaskReply) erro
 }
 
 // 分配一个任务之后应该等待回复，十秒没收到回复则重新把这个任务加入队列
-func (c *Coordinator) taskWaiter(task interface{}, waiterChan chan int, timeUp chan int) {
+func (c *Coordinator) taskWaiter(task interface{}, waiterChan chan int, timeUp chan int, quitTimer chan int) {
 	select {
 	case <-waiterChan:
 		switch task := task.(type) {
@@ -169,6 +176,7 @@ func (c *Coordinator) taskWaiter(task interface{}, waiterChan chan int, timeUp c
 		default:
 			log.Fatalln("taskWaiter(): invalid type!")
 		}
+		quitTimer <- 1
 
 	case <-timeUp:
 		c.reputTask(task)
