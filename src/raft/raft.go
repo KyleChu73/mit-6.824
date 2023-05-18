@@ -19,11 +19,15 @@ package raft
 
 import (
 	//	"bytes"
-	"sync"
+
+	"math/rand"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
+	"6.824/debug"
 	"6.824/labrpc"
+	"github.com/sasha-s/go-deadlock"
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -47,9 +51,15 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	// mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	deadlock.Mutex
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -58,7 +68,32 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	state State
 
+	currentTerm int // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor    int // candidateId that received vote in current term (or null if none)
+}
+
+type State int
+
+const (
+	Follower State = iota
+	Candidate
+	Leader
+)
+
+func (s State) String() string {
+	var ret string
+	switch s {
+	case Follower:
+		ret = "FOLLOWER"
+	case Candidate:
+		ret = "CANDIDATE"
+	case Leader:
+		ret = "LEADER"
+	}
+
+	return ret
 }
 
 // return currentTerm and whether this server
@@ -127,17 +162,83 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int // candidate’s term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // index of candidate’s last log entry (§5.4)
+	LastLogTerm  int // term of candidate’s last log entry (§5.4)
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int  // currentTerm, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
 }
 
 // example RequestVote RPC handler.
+// received by follower
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	// 1.	Reply false if term < currentTerm (§5.1)
+	// 2.	If votedFor is null or candidateId, and candidate’s log is at
+	// 		least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+}
+
+// Invoked by candidates to gather votes (§5.2).
+func (rf *Raft) CallRequestVote(target int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[target].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+type AppendEntriesArgs struct {
+	Term         int        // leader’s term
+	LeaderId     int        // so follower can redirect clients
+	PrevLogIndex int        // index of log entry immediately preceding new ones 紧接在新条目之前的日志条目的索引
+	PrevLogTerm  int        // term of prevLogIndex entry
+	Entries      []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int        // leader’s commitIndex
+}
+
+type AppendEntriesReply struct {
+	Term    int  // currentTerm, for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+// received by follower (TODO: what about candidates?)
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// TODO: race?
+	rf.Lock()
+	defer rf.Unlock()
+
+	currentTerm := rf.currentTerm // follower
+	success := true
+
+	// 1.	Reply false if term < currentTerm (§5.1)
+	if args.Term < currentTerm {
+		success = false
+	}
+
+	// 2.	Reply false if log doesn’t contain an entry at prevLogIndex
+	// 		whose term matches prevLogTerm (§5.3)
+
+	// 3.	If an existing entry conflicts with a new one (same index
+	// 		but different terms), delete the existing entry and all that
+	// 		follow it (§5.3)
+
+	// 4.	Append any new entries not already in the log
+
+	// 5.	If leaderCommit > commitIndex, set commitIndex =
+	// 		min(leaderCommit, index of last new entry)
+
+	reply.Term = currentTerm
+	reply.Success = success
+}
+
+// Invoked by leader to replicate log entries (§5.3); also used as heartbeat (§5.2).
+func (rf *Raft) CallAppendEntries(target int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[target].Call("Raft.AppendEntries", args, reply)
+	return ok
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -215,15 +316,36 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
+// Go程 ticker 会开始一轮新的选举，如果他最近没有收到心跳（超时）
+// 但是要注意，leader 是发出心跳的那方
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		electionTimeout := 150 + rand.Intn(150) // TODO: 150ms ~ 300ms ok?
+		debug.Debug(debug.DTimer, "S%d Follower, starting election timeout(%d ms)",
+			rf.me, electionTimeout)
+		timer := time.NewTimer(time.Duration(electionTimeout) * time.Millisecond) // ms
 
 	}
 }
+
+// func (rf *Raft) mainLoop() {
+// 	for rf.killed() == false {
+// 		rf.Lock()
+// 		state := rf.state
+// 		rf.Unlock()
+// 		switch state {
+// 		case Follower:
+// 		case Candidate:
+// 		case Leader:
+// 		default:
+// 			log.Fatalf("undefined state, should be %v, %v or %v\n", Follower, Candidate, Leader)
+// 		}
+// 	}
+// }
 
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -242,6 +364,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.state = Follower
+	rf.currentTerm = 0
+	rf.votedFor = -1 // null
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
