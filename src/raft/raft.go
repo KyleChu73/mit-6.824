@@ -68,29 +68,36 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state State
 
-	currentTerm int // latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	votedFor    int // candidateId that received vote in current term (or null if none)
+	state     State
+	onRPCChan chan int
+
+	// Persistent state on all servers:
+
+	currentTerm int        // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor    int        // candidateId that received vote in current term (or null if none)
+	log         []LogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+
+	// Volatile state on all servers:
 }
 
 type State int
 
 const (
-	Follower State = iota
-	Candidate
-	Leader
+	followerState State = iota
+	candidateState
+	leaderState
 )
 
 func (s State) String() string {
 	var ret string
 	switch s {
-	case Follower:
-		ret = "FOLLOWER"
-	case Candidate:
-		ret = "CANDIDATE"
-	case Leader:
-		ret = "LEADER"
+	case followerState:
+		ret = "Follower"
+	case candidateState:
+		ret = "Candidate"
+	case leaderState:
+		ret = "Leader"
 	}
 
 	return ret
@@ -177,18 +184,146 @@ type RequestVoteReply struct {
 }
 
 // example RequestVote RPC handler.
-// received by follower
+// 作为一个 follower 收到，进行投票
+// 作为一个 candidate 收到，
+// 作为一个 leader 收到，
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	reply.VoteGranted = false
+
+	rf.Lock()
+	defer rf.Unlock()
+
 	// 1.	Reply false if term < currentTerm (§5.1)
 	// 2.	If votedFor is null or candidateId, and candidate’s log is at
 	// 		least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+
+	if args.Term >= rf.currentTerm {
+		// If RPC request or response contains term T > currentTerm:
+		// set currentTerm = T, convert to follower (§5.1)
+		if args.Term > rf.currentTerm {
+			debug.Debug(debug.DTerm, "S%d %s, curTerm %d < term %d",
+				rf.me, rf.state, rf.currentTerm, args.Term)
+			rf.currentTerm = args.Term
+			rf.resetToFollower() // 一定要重置
+		}
+		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+			debug.Debug(debug.DVote, "S%d %s, voted to S%d Candidate", rf.me, rf.state, args.CandidateId)
+		}
+	}
+
+	reply.Term = rf.currentTerm
+
+	rf.onRPCChan <- 1
+}
+
+// this doesn't own lock!
+func (rf *Raft) resetToFollower() {
+	if rf.state != followerState {
+		debug.Debug(debug.DTerm, "S%d %s, convert to follower", rf.me, rf.state)
+	}
+	rf.state = followerState
+	rf.votedFor = -1
 }
 
 // Invoked by candidates to gather votes (§5.2).
 func (rf *Raft) CallRequestVote(target int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[target].Call("Raft.RequestVote", args, reply)
 	return ok
+}
+
+type WrappedRequestVoteReply struct {
+	ok   bool
+	from int
+	*RequestVoteReply
+}
+
+func (rf *Raft) callRequestVoteChan(target int, args *RequestVoteArgs, ch chan *WrappedRequestVoteReply) {
+	reply := RequestVoteReply{}
+	debug.Debug(debug.DVote, "S%d Candidate, send RequestVote to S%d", args.CandidateId, target)
+	ok := rf.peers[target].Call("Raft.RequestVote", args, &reply)
+	select {
+	case ch <- &WrappedRequestVoteReply{ok: ok, from: target, RequestVoteReply: &reply}:
+	default:
+		// do not block
+	}
+}
+
+func (rf *Raft) sendRequestVoteToAll(elected chan<- int, quit <-chan int) {
+	grantedVotes := 1
+	replyChan := make(chan *WrappedRequestVoteReply, len(rf.peers)-1)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.Lock()
+		if rf.state == candidateState {
+			args := RequestVoteArgs{
+				Term:        rf.currentTerm,
+				CandidateId: rf.me,
+			}
+			go rf.callRequestVoteChan(i, &args, replyChan)
+		} else if rf.state == followerState {
+			rf.Unlock()
+			return
+		}
+		rf.Unlock()
+	}
+
+	for !rf.killed() {
+		var reply *WrappedRequestVoteReply
+		select {
+		case <-quit:
+			//   While waiting for votes, a candidate may receive an
+			// AppendEntries RPC from another server claiming to be
+			// leader. If the leader’s term (included in its RPC) is at least
+			// as large as (>=) the candidate’s current term, then the candidate
+			// recognizes the leader as legitimate and returns to follower
+			// state.
+			// so... I'll become a follower
+			// TODO go rf.callRequestVoteChan() leak?
+			return
+
+		case reply = <-replyChan:
+			// 在下面的过程中，candidate 可能已经恢复成 follower 了
+			// （可能已有其他人成为leader，见 AppendEntries），
+			// 但是还没来的及 quit。
+			// 要时刻注意这个逻辑。
+			if reply.ok {
+				rf.Lock()
+				// 任何时候 term > rf.currentTerm 都要这么做
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.resetToFollower()
+					rf.Unlock()
+					return
+				}
+				if reply.VoteGranted {
+					grantedVotes++
+					debug.Debug(debug.DVote, "S%d %s, received vote from S%d",
+						rf.me, rf.state, reply.from)
+					if grantedVotes > len(rf.peers)/2 && rf.state == candidateState {
+						elected <- 1
+						rf.Unlock()
+						return
+					}
+				}
+				rf.Unlock()
+			} else {
+				rf.Lock()
+				args := RequestVoteArgs{
+					Term:        rf.currentTerm,
+					CandidateId: rf.me,
+				}
+				if rf.state == candidateState {
+					go rf.callRequestVoteChan(reply.from, &args, replyChan)
+				}
+				rf.Unlock()
+			}
+		}
+	}
 }
 
 type AppendEntriesArgs struct {
@@ -205,40 +340,118 @@ type AppendEntriesReply struct {
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 }
 
-// received by follower (TODO: what about candidates?)
+// 作为一个 follower 收到：心跳或日志
+// 作为一个 condidate 收到：如果是一个更新的 leader，转换成 follower
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// TODO: race?
 	rf.Lock()
 	defer rf.Unlock()
 
-	currentTerm := rf.currentTerm // follower
-	success := true
-
-	// 1.	Reply false if term < currentTerm (§5.1)
-	if args.Term < currentTerm {
-		success = false
+	// empty for heartbeat
+	if args.Entries == nil || len(args.Entries) == 0 {
+		debug.Debug(debug.DLog, "S%d %s, received hearbeat from S%d Leader",
+			rf.me, rf.state, args.LeaderId)
+	} else {
+		debug.Debug(debug.DLog2, "S%d %s, received AppendEntries from S%d Leader",
+			rf.me, rf.state, args.LeaderId)
 	}
 
+	// Receiver implementation:
+	// 1.	Reply false if term < currentTerm (§5.1)
 	// 2.	Reply false if log doesn’t contain an entry at prevLogIndex
 	// 		whose term matches prevLogTerm (§5.3)
-
 	// 3.	If an existing entry conflicts with a new one (same index
 	// 		but different terms), delete the existing entry and all that
 	// 		follow it (§5.3)
-
 	// 4.	Append any new entries not already in the log
-
 	// 5.	If leaderCommit > commitIndex, set commitIndex =
 	// 		min(leaderCommit, index of last new entry)
 
-	reply.Term = currentTerm
-	reply.Success = success
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	if rf.currentTerm < args.Term ||
+		// If the leader’s term (included in its RPC) is at least
+		// as large as the candidate’s current term, then the candidate
+		// recognizes the leader as legitimate and returns to follower
+		// state. If the term in the RPC is smaller than the candidate’s
+		// current term, then the candidate rejects the RPC and continues in candidate state.
+		(rf.state == candidateState && rf.currentTerm == args.Term) {
+		debug.Debug(debug.DTerm, "S%d %s, curTerm %d < term %d",
+			rf.me, rf.state, rf.currentTerm, args.Term)
+		rf.currentTerm = args.Term
+		if rf.state != followerState {
+			debug.Debug(debug.DTerm, "S%d %s, convert to follower", rf.me, rf.state)
+		}
+		rf.state = followerState
+		rf.votedFor = -1 // 一定要重置
+	}
+
+	rf.onRPCChan <- 1
+}
+
+type WrappedAppendEntriesReply struct {
+	ok   bool
+	from int
+	*AppendEntriesReply
+}
+
+func (rf *Raft) callAppendEntriesChan(target int, args *AppendEntriesArgs, ch chan *WrappedAppendEntriesReply) {
+	reply := AppendEntriesReply{}
+	debug.Debug(debug.DLog, "S%d Leader, send heartbeat to S%d", args.LeaderId, target)
+	ok := rf.peers[target].Call("Raft.AppendEntries", args, &reply)
+	select {
+	case ch <- &WrappedAppendEntriesReply{ok: ok, from: target, AppendEntriesReply: &reply}:
+	default:
+		// do not block
+	}
 }
 
 // Invoked by leader to replicate log entries (§5.3); also used as heartbeat (§5.2).
 func (rf *Raft) CallAppendEntries(target int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[target].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) sendAppendEntriesToAll(quit <-chan int) {
+	replyChan := make(chan *WrappedAppendEntriesReply, len(rf.peers)-1)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.Lock()
+		if rf.state == leaderState {
+			args := AppendEntriesArgs{
+				Term:     rf.currentTerm,
+				LeaderId: rf.me,
+				Entries:  nil,
+			}
+			go rf.callAppendEntriesChan(i, &args, replyChan)
+		} else if rf.state == followerState {
+			rf.Unlock()
+			return
+		}
+		rf.Unlock()
+	}
+
+	for !rf.killed() {
+		var reply *WrappedAppendEntriesReply
+		select {
+		case <-quit:
+			return
+		case reply = <-replyChan:
+			if reply.ok {
+				rf.Lock()
+				// 任何时候 term > rf.currentTerm 都要这么做
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.resetToFollower()
+					rf.Unlock()
+					return
+				}
+				rf.Unlock()
+			}
+		}
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -268,10 +481,10 @@ func (rf *Raft) CallAppendEntries(target int, args *AppendEntriesArgs, reply *Ap
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
+// func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+// 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+// 	return ok
+// }
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -314,21 +527,120 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func randomElectionTimeout() time.Duration {
+	return time.Duration(150+rand.Intn(150)) * time.Millisecond // TODO: 150ms ~ 300ms ok?
+}
+
+const heartbeatInterval = 40 * time.Millisecond
+
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 // Go程 ticker 会开始一轮新的选举，如果他最近没有收到心跳（超时）
 // 但是要注意，leader 是发出心跳的那方
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+
+followerLoop:
+	for !rf.killed() {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		electionTimeout := 150 + rand.Intn(150) // TODO: 150ms ~ 300ms ok?
-		debug.Debug(debug.DTimer, "S%d Follower, starting election timeout(%d ms)",
-			rf.me, electionTimeout)
-		timer := time.NewTimer(time.Duration(electionTimeout) * time.Millisecond) // ms
+		electionTimeout := randomElectionTimeout()
+		rf.Lock()
+		debug.Debug(debug.DTimer, "S%d %s, starting election timeout(%d ms)",
+			rf.me, rf.state, electionTimeout/time.Millisecond)
+		rf.Unlock()
+		timer := time.NewTimer(electionTimeout) // ms
 
+	followerReceivingHeartbeat:
+		for !rf.killed() {
+			select {
+			case <-rf.onRPCChan:
+				electionTimeout = randomElectionTimeout()
+				timer.Reset(electionTimeout)
+				rf.Lock()
+				debug.Debug(debug.DTimer, "S%d %s, reset election timeout(%d ms)",
+					rf.me, rf.state, electionTimeout/time.Millisecond)
+				rf.Unlock()
+			case <-timer.C:
+				rf.Lock()
+				debug.Debug(debug.DTimer, "S%d %s, election timeout!", rf.me, rf.state)
+				rf.Unlock()
+				break followerReceivingHeartbeat
+			}
+		}
+		// If election timeout elapses without receiving AppendEntries
+		// RPC from current leader or granting vote to candidate:
+		// convert to candidate(Fig. 2)
+		rf.Lock()
+		debug.Debug(debug.DInfo, "S%d %s, convert to candidate", rf.me, rf.state)
+		rf.state = candidateState
+		rf.Unlock()
+
+	candidateElection:
+		for !rf.killed() {
+			rf.Lock()
+			debug.Debug(debug.DInfo, "S%d %s, start election", rf.me, rf.state)
+			rf.currentTerm++
+			rf.votedFor = rf.me
+			rf.Unlock()
+			electionTimeout = randomElectionTimeout()
+			timer.Reset(electionTimeout)
+			// Send RequestVote RPCs to all other servers
+			elect := make(chan int)
+			quitReqVotes := make(chan int)
+			go rf.sendRequestVoteToAll(elect, quitReqVotes)
+			for !rf.killed() {
+				select {
+				case <-elect:
+					break candidateElection
+
+				case <-rf.onRPCChan:
+					//   While waiting for votes, a candidate may receive an
+					// AppendEntries RPC from another server claiming to be
+					// leader. If the leader’s term (included in its RPC) is at least
+					// as large as the candidate’s current term, then the candidate
+					// recognizes the leader as legitimate and returns to follower
+					// state. If the term in the RPC is smaller than the candidate’s
+					// current term, then the candidate rejects the RPC and continues
+					// in candidate state. (§5.2)
+					if rf.state == followerState {
+						timer.Stop()
+						quitReqVotes <- 1
+						continue followerLoop
+					}
+					// ignore
+
+				case <-timer.C:
+					// If election timeout elapses: start new election. (Fig. 2)
+					// ... When this happens, each candidate will time out
+					// and start a new election by incrementing its term
+					// and initiating another round of RequestVote RPCs. (§5.2)
+					rf.Lock()
+					debug.Debug(debug.DTimer, "S%d %s, start new election",
+						rf.me, rf.state)
+					rf.Unlock()
+					continue candidateElection
+				}
+			}
+		}
+
+		quitHeartbeat := make(chan int)
+		timer = time.NewTimer(0) // 立刻发送心跳
+	leaderHeartbeatLoop:
+		for !rf.killed() {
+			select {
+			case <-rf.onRPCChan:
+				if rf.state == followerState {
+					timer.Stop()
+					quitHeartbeat <- 1
+					break leaderHeartbeatLoop
+				}
+			case <-timer.C:
+				go rf.sendAppendEntriesToAll(quitHeartbeat)
+				timer.Reset(heartbeatInterval)
+			}
+		}
 	}
 }
 
@@ -364,7 +676,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.state = Follower
+	rf.state = followerState
+
+	rf.onRPCChan = make(chan int)
+
 	rf.currentTerm = 0
 	rf.votedFor = -1 // null
 
