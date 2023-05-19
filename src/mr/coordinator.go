@@ -109,9 +109,13 @@ func timeUpNotifier(quit chan int) chan int {
 		time.Sleep(10 * time.Second)
 		select {
 		case <-quit:
+			log.Printf("timer quit...\n")
+			close(ch)
 			return
 		default:
+			// 不会阻塞
 		}
+		// 如果 taskerWaiter 在超时前就退出了，那么下面这个操作可能永久阻塞
 		ch <- 1
 	}()
 	return ch
@@ -181,7 +185,6 @@ func (c *Coordinator) taskWaiter(task interface{}, waiterChan chan int, timeUp c
 	case <-timeUp:
 		c.reputTask(task)
 	}
-
 }
 
 func (c *Coordinator) reputTask(task interface{}) {
