@@ -302,8 +302,8 @@ func (rf *Raft) sendRequestVoteToAll(elected chan<- int, quit <-chan int) {
 				}
 				if reply.VoteGranted {
 					grantedVotes++
-					debug.Debug(debug.DVote, "S%d %s, received vote from S%d",
-						rf.me, rf.state, reply.from)
+					debug.Debug(debug.DVote, "S%d %s, received vote from S%d, %d(expected >%d)",
+						rf.me, rf.state, reply.from, grantedVotes, len(rf.peers)/2)
 					if grantedVotes > len(rf.peers)/2 && rf.state == candidateState {
 						elected <- 1
 						rf.Unlock()
@@ -412,7 +412,7 @@ func (rf *Raft) CallAppendEntries(target int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) sendAppendEntriesToAll(quit <-chan int) {
+func (rf *Raft) sendHeartbeatToAll(quit <-chan int) {
 	replyChan := make(chan *WrappedAppendEntriesReply, len(rf.peers)-1)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -528,10 +528,10 @@ func (rf *Raft) killed() bool {
 }
 
 func randomElectionTimeout() time.Duration {
-	return time.Duration(150+rand.Intn(150)) * time.Millisecond // TODO: 150ms ~ 300ms ok?
+	return time.Duration(250+rand.Intn(250)) * time.Millisecond // TODO: 150ms ~ 300ms ok?
 }
 
-const heartbeatInterval = 40 * time.Millisecond
+const heartbeatInterval = 100 * time.Millisecond
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
@@ -625,6 +625,10 @@ followerLoop:
 			}
 		}
 
+		rf.Lock()
+		rf.state = leaderState
+		debug.Debug(debug.DLeader, "S%d become leader in term %d", rf.me, rf.currentTerm)
+		rf.Unlock()
 		quitHeartbeat := make(chan int)
 		timer = time.NewTimer(0) // 立刻发送心跳
 	leaderHeartbeatLoop:
@@ -634,10 +638,12 @@ followerLoop:
 				if rf.state == followerState {
 					timer.Stop()
 					quitHeartbeat <- 1
+
 					break leaderHeartbeatLoop
 				}
 			case <-timer.C:
-				go rf.sendAppendEntriesToAll(quitHeartbeat)
+				debug.Debug(debug.DLog, "S%d %s, start sending heartbeat", rf.me, rf.state)
+				go rf.sendHeartbeatToAll(quitHeartbeat)
 				timer.Reset(heartbeatInterval)
 			}
 		}
