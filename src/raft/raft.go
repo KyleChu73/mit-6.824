@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"fmt"
 	"math/rand"
 	"sync/atomic"
 	"time"
@@ -110,6 +111,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.Lock()
+	term = rf.currentTerm
+	isleader = rf.state == leaderState
+	rf.Unlock()
 	return term, isleader
 }
 
@@ -183,6 +188,11 @@ type RequestVoteReply struct {
 	VoteGranted bool // true means candidate received vote
 }
 
+// this doesn't hold lock
+func (rf *Raft) fmtServerInfo() string {
+	return fmt.Sprintf("S%d %s (votedFor=%d)", rf.me, rf.state, rf.votedFor)
+}
+
 // example RequestVote RPC handler.
 // 作为一个 follower 收到，进行投票
 // 作为一个 candidate 收到，
@@ -192,7 +202,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = false
 
 	rf.Lock()
-	defer rf.Unlock()
 
 	// 1.	Reply false if term < currentTerm (§5.1)
 	// 2.	If votedFor is null or candidateId, and candidate’s log is at
@@ -202,27 +211,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// If RPC request or response contains term T > currentTerm:
 		// set currentTerm = T, convert to follower (§5.1)
 		if args.Term > rf.currentTerm {
-			debug.Debug(debug.DTerm, "S%d %s, curTerm %d < term %d",
-				rf.me, rf.state, rf.currentTerm, args.Term)
+			debug.Debug(debug.DTerm, "%s, curTerm %d < term %d",
+				rf.fmtServerInfo(), rf.currentTerm, args.Term)
 			rf.currentTerm = args.Term
 			rf.resetToFollower() // 一定要重置
 		}
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-			debug.Debug(debug.DVote, "S%d %s, voted to S%d Candidate", rf.me, rf.state, args.CandidateId)
+			debug.Debug(debug.DVote, "%s, voted to S%d Candidate", rf.fmtServerInfo(), args.CandidateId)
 		}
 	}
 
 	reply.Term = rf.currentTerm
-
+	rf.Unlock()
+	
 	rf.onRPCChan <- 1
 }
 
 // this doesn't own lock!
 func (rf *Raft) resetToFollower() {
 	if rf.state != followerState {
-		debug.Debug(debug.DTerm, "S%d %s, convert to follower", rf.me, rf.state)
+		debug.Debug(debug.DTerm, "%s, convert to follower", rf.fmtServerInfo())
 	}
 	rf.state = followerState
 	rf.votedFor = -1
@@ -302,10 +312,13 @@ func (rf *Raft) sendRequestVoteToAll(elected chan<- int, quit <-chan int) {
 				}
 				if reply.VoteGranted {
 					grantedVotes++
-					debug.Debug(debug.DVote, "S%d %s, received vote from S%d, %d(expected >%d)",
-						rf.me, rf.state, reply.from, grantedVotes, len(rf.peers)/2)
+					debug.Debug(debug.DVote, "%s, received vote from S%d, %d(expected >%d)",
+						rf.fmtServerInfo(), reply.from, grantedVotes, len(rf.peers)/2)
 					if grantedVotes > len(rf.peers)/2 && rf.state == candidateState {
-						elected <- 1
+						select {
+						case elected <- 1:
+						default:
+						}
 						rf.Unlock()
 						return
 					}
@@ -345,15 +358,14 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// TODO: race?
 	rf.Lock()
-	defer rf.Unlock()
 
 	// empty for heartbeat
 	if args.Entries == nil || len(args.Entries) == 0 {
-		debug.Debug(debug.DLog, "S%d %s, received hearbeat from S%d Leader",
-			rf.me, rf.state, args.LeaderId)
+		debug.Debug(debug.DLog, "%s, received hearbeat from S%d Leader",
+			rf.fmtServerInfo(), args.LeaderId)
 	} else {
-		debug.Debug(debug.DLog2, "S%d %s, received AppendEntries from S%d Leader",
-			rf.me, rf.state, args.LeaderId)
+		debug.Debug(debug.DLog2, "%s, received AppendEntries from S%d Leader",
+			rf.fmtServerInfo(), args.LeaderId)
 	}
 
 	// Receiver implementation:
@@ -376,15 +388,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// state. If the term in the RPC is smaller than the candidate’s
 		// current term, then the candidate rejects the RPC and continues in candidate state.
 		(rf.state == candidateState && rf.currentTerm == args.Term) {
-		debug.Debug(debug.DTerm, "S%d %s, curTerm %d < term %d",
-			rf.me, rf.state, rf.currentTerm, args.Term)
+		debug.Debug(debug.DTerm, "%s, curTerm %d < term %d",
+			rf.fmtServerInfo(), rf.currentTerm, args.Term)
 		rf.currentTerm = args.Term
 		if rf.state != followerState {
-			debug.Debug(debug.DTerm, "S%d %s, convert to follower", rf.me, rf.state)
+			debug.Debug(debug.DTerm, "%s, convert to follower", rf.fmtServerInfo())
 		}
 		rf.state = followerState
 		rf.votedFor = -1 // 一定要重置
 	}
+	rf.Unlock()
 
 	rf.onRPCChan <- 1
 }
@@ -547,8 +560,8 @@ followerLoop:
 		// time.Sleep().
 		electionTimeout := randomElectionTimeout()
 		rf.Lock()
-		debug.Debug(debug.DTimer, "S%d %s, starting election timeout(%d ms)",
-			rf.me, rf.state, electionTimeout/time.Millisecond)
+		debug.Debug(debug.DTimer, "%s, starting election timeout(%d ms)",
+			rf.fmtServerInfo(), electionTimeout/time.Millisecond)
 		rf.Unlock()
 		timer := time.NewTimer(electionTimeout) // ms
 
@@ -559,12 +572,12 @@ followerLoop:
 				electionTimeout = randomElectionTimeout()
 				timer.Reset(electionTimeout)
 				rf.Lock()
-				debug.Debug(debug.DTimer, "S%d %s, reset election timeout(%d ms)",
-					rf.me, rf.state, electionTimeout/time.Millisecond)
+				debug.Debug(debug.DTimer, "%s, reset election timeout(%d ms)",
+					rf.fmtServerInfo(), electionTimeout/time.Millisecond)
 				rf.Unlock()
 			case <-timer.C:
 				rf.Lock()
-				debug.Debug(debug.DTimer, "S%d %s, election timeout!", rf.me, rf.state)
+				debug.Debug(debug.DTimer, "%s, election timeout!", rf.fmtServerInfo())
 				rf.Unlock()
 				break followerReceivingHeartbeat
 			}
@@ -573,16 +586,16 @@ followerLoop:
 		// RPC from current leader or granting vote to candidate:
 		// convert to candidate(Fig. 2)
 		rf.Lock()
-		debug.Debug(debug.DInfo, "S%d %s, convert to candidate", rf.me, rf.state)
+		debug.Debug(debug.DInfo, "%s, convert to candidate", rf.fmtServerInfo())
 		rf.state = candidateState
 		rf.Unlock()
 
 	candidateElection:
 		for !rf.killed() {
 			rf.Lock()
-			debug.Debug(debug.DInfo, "S%d %s, start election", rf.me, rf.state)
 			rf.currentTerm++
 			rf.votedFor = rf.me
+			debug.Debug(debug.DInfo, "%s, start election", rf.fmtServerInfo())
 			rf.Unlock()
 			electionTimeout = randomElectionTimeout()
 			timer.Reset(electionTimeout)
@@ -604,11 +617,17 @@ followerLoop:
 					// state. If the term in the RPC is smaller than the candidate’s
 					// current term, then the candidate rejects the RPC and continues
 					// in candidate state. (§5.2)
+					rf.Lock()
 					if rf.state == followerState {
 						timer.Stop()
-						quitReqVotes <- 1
+						select {
+						case quitReqVotes <- 1:
+						default:
+						}
+						rf.Unlock()
 						continue followerLoop
 					}
+					rf.Unlock()
 					// ignore
 
 				case <-timer.C:
@@ -617,8 +636,8 @@ followerLoop:
 					// and start a new election by incrementing its term
 					// and initiating another round of RequestVote RPCs. (§5.2)
 					rf.Lock()
-					debug.Debug(debug.DTimer, "S%d %s, start new election",
-						rf.me, rf.state)
+					debug.Debug(debug.DTimer, "%s, start new election",
+						rf.fmtServerInfo())
 					rf.Unlock()
 					continue candidateElection
 				}
@@ -635,35 +654,27 @@ followerLoop:
 		for !rf.killed() {
 			select {
 			case <-rf.onRPCChan:
+				rf.Lock()
 				if rf.state == followerState {
 					timer.Stop()
-					quitHeartbeat <- 1
-
+					select {
+					case quitHeartbeat <- 1:
+					default:
+					}
+					rf.Unlock()
 					break leaderHeartbeatLoop
 				}
+				rf.Unlock()
 			case <-timer.C:
-				debug.Debug(debug.DLog, "S%d %s, start sending heartbeat", rf.me, rf.state)
+				rf.Lock()
+				debug.Debug(debug.DLog, "%s, start sending heartbeat", rf.fmtServerInfo())
+				rf.Unlock()
 				go rf.sendHeartbeatToAll(quitHeartbeat)
 				timer.Reset(heartbeatInterval)
 			}
 		}
 	}
 }
-
-// func (rf *Raft) mainLoop() {
-// 	for rf.killed() == false {
-// 		rf.Lock()
-// 		state := rf.state
-// 		rf.Unlock()
-// 		switch state {
-// 		case Follower:
-// 		case Candidate:
-// 		case Leader:
-// 		default:
-// 			log.Fatalf("undefined state, should be %v, %v or %v\n", Follower, Candidate, Leader)
-// 		}
-// 	}
-// }
 
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
