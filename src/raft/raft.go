@@ -225,7 +225,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.currentTerm
 	rf.Unlock()
-	
+
 	rf.onRPCChan <- 1
 }
 
@@ -620,10 +620,7 @@ followerLoop:
 					rf.Lock()
 					if rf.state == followerState {
 						timer.Stop()
-						select {
-						case quitReqVotes <- 1:
-						default:
-						}
+						quitReqVotes <- 1
 						rf.Unlock()
 						continue followerLoop
 					}
@@ -639,6 +636,7 @@ followerLoop:
 					debug.Debug(debug.DTimer, "%s, start new election",
 						rf.fmtServerInfo())
 					rf.Unlock()
+					quitReqVotes <- 1
 					continue candidateElection
 				}
 			}
@@ -649,7 +647,11 @@ followerLoop:
 		debug.Debug(debug.DLeader, "S%d become leader in term %d", rf.me, rf.currentTerm)
 		rf.Unlock()
 		quitHeartbeat := make(chan int)
-		timer = time.NewTimer(0) // 立刻发送心跳
+		rf.Lock()
+		debug.Debug(debug.DLog, "%s, first sending heartbeat", rf.fmtServerInfo())
+		rf.Unlock()
+		go rf.sendHeartbeatToAll(quitHeartbeat)
+		timer = time.NewTimer(heartbeatInterval) // 立刻发送心跳
 	leaderHeartbeatLoop:
 		for !rf.killed() {
 			select {
@@ -657,17 +659,15 @@ followerLoop:
 				rf.Lock()
 				if rf.state == followerState {
 					timer.Stop()
-					select {
-					case quitHeartbeat <- 1:
-					default:
-					}
+					quitHeartbeat <- 1
 					rf.Unlock()
 					break leaderHeartbeatLoop
 				}
 				rf.Unlock()
 			case <-timer.C:
+				quitHeartbeat <- 1
 				rf.Lock()
-				debug.Debug(debug.DLog, "%s, start sending heartbeat", rf.fmtServerInfo())
+				debug.Debug(debug.DLog, "%s, sending heartbeat", rf.fmtServerInfo())
 				rf.Unlock()
 				go rf.sendHeartbeatToAll(quitHeartbeat)
 				timer.Reset(heartbeatInterval)
