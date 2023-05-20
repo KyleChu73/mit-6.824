@@ -620,8 +620,8 @@ followerLoop:
 					rf.Lock()
 					if rf.state == followerState {
 						timer.Stop()
-						quitReqVotes <- 1
 						rf.Unlock()
+						quitReqVotes <- 1
 						continue followerLoop
 					}
 					rf.Unlock()
@@ -659,8 +659,8 @@ followerLoop:
 				rf.Lock()
 				if rf.state == followerState {
 					timer.Stop()
-					quitHeartbeat <- 1
 					rf.Unlock()
+					quitHeartbeat <- 1
 					break leaderHeartbeatLoop
 				}
 				rf.Unlock()
