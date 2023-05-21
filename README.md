@@ -2,7 +2,7 @@
 
 连接：[mit-6.824](https://pdos.csail.mit.edu/6.824/schedule.html)
 
-这是一个刚启动 & 进行中的项目，目前完成了：MapReduce
+这是一个刚启动 & 进行中的项目，目前完成了：MapReduce，Raft（leader election） 
 
 Most comments in the code are in Chinese. If you need an English translation, please let me know.
 
