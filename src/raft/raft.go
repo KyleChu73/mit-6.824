@@ -190,7 +190,7 @@ type RequestVoteReply struct {
 
 // this doesn't hold lock
 func (rf *Raft) fmtServerInfo() string {
-	return fmt.Sprintf("S%d %s (votedFor=%d)", rf.me, rf.state, rf.votedFor)
+	return fmt.Sprintf("S%d %s (votedFor=%d,term=%d)", rf.me, rf.state, rf.votedFor, rf.currentTerm)
 }
 
 // example RequestVote RPC handler.
@@ -206,6 +206,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 1.	Reply false if term < currentTerm (§5.1)
 	// 2.	If votedFor is null or candidateId, and candidate’s log is at
 	// 		least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		rf.Unlock()
+		return
+	}
 
 	if args.Term >= rf.currentTerm {
 		// If RPC request or response contains term T > currentTerm:
@@ -261,7 +268,8 @@ func (rf *Raft) callRequestVoteChan(target int, args *RequestVoteArgs, ch chan *
 	}
 }
 
-func (rf *Raft) sendRequestVoteToAll(elected chan<- int, quit <-chan int) {
+func (rf *Raft) sendRequestVoteToAll(elected chan<- int, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
 	grantedVotes := 1
 	replyChan := make(chan *WrappedRequestVoteReply, len(rf.peers)-1)
 	for i := 0; i < len(rf.peers); i++ {
@@ -283,24 +291,15 @@ func (rf *Raft) sendRequestVoteToAll(elected chan<- int, quit <-chan int) {
 	}
 
 	for !rf.killed() {
+		rf.Lock()
+		if rf.state != candidateState {
+			rf.Unlock()
+			break
+		}
+		rf.Unlock()
 		var reply *WrappedRequestVoteReply
 		select {
-		case <-quit:
-			//   While waiting for votes, a candidate may receive an
-			// AppendEntries RPC from another server claiming to be
-			// leader. If the leader’s term (included in its RPC) is at least
-			// as large as (>=) the candidate’s current term, then the candidate
-			// recognizes the leader as legitimate and returns to follower
-			// state.
-			// so... I'll become a follower
-			// TODO go rf.callRequestVoteChan() leak?
-			return
-
 		case reply = <-replyChan:
-			// 在下面的过程中，candidate 可能已经恢复成 follower 了
-			// （可能已有其他人成为leader，见 AppendEntries），
-			// 但是还没来的及 quit。
-			// 要时刻注意这个逻辑。
 			if reply.ok {
 				rf.Lock()
 				// 任何时候 term > rf.currentTerm 都要这么做
@@ -315,11 +314,8 @@ func (rf *Raft) sendRequestVoteToAll(elected chan<- int, quit <-chan int) {
 					debug.Debug(debug.DVote, "%s, received vote from S%d, %d(expected >%d)",
 						rf.fmtServerInfo(), reply.from, grantedVotes, len(rf.peers)/2)
 					if grantedVotes > len(rf.peers)/2 && rf.state == candidateState {
-						select {
-						case elected <- 1:
-						default:
-						}
 						rf.Unlock()
+						elected <- 1
 						return
 					}
 				}
@@ -335,6 +331,9 @@ func (rf *Raft) sendRequestVoteToAll(elected chan<- int, quit <-chan int) {
 				}
 				rf.Unlock()
 			}
+		case <-timer.C:
+			// 避免 goroutine 泄露
+			return
 		}
 	}
 }
@@ -356,16 +355,14 @@ type AppendEntriesReply struct {
 // 作为一个 follower 收到：心跳或日志
 // 作为一个 condidate 收到：如果是一个更新的 leader，转换成 follower
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// TODO: race?
 	rf.Lock()
-
 	// empty for heartbeat
 	if args.Entries == nil || len(args.Entries) == 0 {
-		debug.Debug(debug.DLog, "%s, received hearbeat from S%d Leader",
-			rf.fmtServerInfo(), args.LeaderId)
+		debug.Debug(debug.DLog, "%s, received hearbeat from S%d Leader(term %d)",
+			rf.fmtServerInfo(), args.LeaderId, args.Term)
 	} else {
-		debug.Debug(debug.DLog2, "%s, received AppendEntries from S%d Leader",
-			rf.fmtServerInfo(), args.LeaderId)
+		debug.Debug(debug.DLog2, "%s, received AppendEntries from S%d Leader(term %d)",
+			rf.fmtServerInfo(), args.LeaderId, args.Term)
 	}
 
 	// Receiver implementation:
@@ -379,24 +376,37 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 5.	If leaderCommit > commitIndex, set commitIndex =
 	// 		min(leaderCommit, index of last new entry)
 
+	// If a server receives a request with a stale term
+	// number, it rejects the request. (§5.1)
+	if args.Term < rf.currentTerm {
+		rf.Unlock()
+		return
+	}
+
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
-	if rf.currentTerm < args.Term ||
-		// If the leader’s term (included in its RPC) is at least
-		// as large as the candidate’s current term, then the candidate
-		// recognizes the leader as legitimate and returns to follower
-		// state. If the term in the RPC is smaller than the candidate’s
-		// current term, then the candidate rejects the RPC and continues in candidate state.
-		(rf.state == candidateState && rf.currentTerm == args.Term) {
+	if args.Term > rf.currentTerm {
 		debug.Debug(debug.DTerm, "%s, curTerm %d < term %d",
 			rf.fmtServerInfo(), rf.currentTerm, args.Term)
 		rf.currentTerm = args.Term
 		if rf.state != followerState {
 			debug.Debug(debug.DTerm, "%s, convert to follower", rf.fmtServerInfo())
 		}
-		rf.state = followerState
-		rf.votedFor = -1 // 一定要重置
+		rf.resetToFollower()
 	}
+
+	// If the leader’s term (included in its RPC) is at least
+	// as large as the candidate’s current term, then the candidate
+	// recognizes the leader as legitimate and returns to follower
+	// state. If the term in the RPC is smaller than the candidate’s
+	// current term, then the candidate rejects the RPC and continues
+	// in candidate state. (§5.2)
+	if rf.state == candidateState && args.Term >= rf.currentTerm {
+		rf.currentTerm = args.Term
+		debug.Debug(debug.DTerm, "%s, convert to follower", rf.fmtServerInfo())
+		rf.resetToFollower()
+	}
+
 	rf.Unlock()
 
 	rf.onRPCChan <- 1
@@ -425,7 +435,8 @@ func (rf *Raft) CallAppendEntries(target int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) sendHeartbeatToAll(quit <-chan int) {
+func (rf *Raft) sendHeartbeatToAll() {
+	timer := time.NewTimer(heartbeatInterval)
 	replyChan := make(chan *WrappedAppendEntriesReply, len(rf.peers)-1)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -447,15 +458,21 @@ func (rf *Raft) sendHeartbeatToAll(quit <-chan int) {
 	}
 
 	for !rf.killed() {
+		rf.Lock()
+		if rf.state != leaderState {
+			rf.Unlock()
+			break
+		}
+		rf.Unlock()
 		var reply *WrappedAppendEntriesReply
 		select {
-		case <-quit:
-			return
 		case reply = <-replyChan:
 			if reply.ok {
 				rf.Lock()
 				// 任何时候 term > rf.currentTerm 都要这么做
 				if reply.Term > rf.currentTerm {
+					debug.Debug(debug.DLeader, "%s, reply term(%d) > curTerm, convert to follower",
+						rf.fmtServerInfo(), reply.Term)
 					rf.currentTerm = reply.Term
 					rf.resetToFollower()
 					rf.Unlock()
@@ -463,6 +480,8 @@ func (rf *Raft) sendHeartbeatToAll(quit <-chan int) {
 				}
 				rf.Unlock()
 			}
+		case <-timer.C:
+			return
 		}
 	}
 }
@@ -578,6 +597,7 @@ followerLoop:
 			case <-timer.C:
 				rf.Lock()
 				debug.Debug(debug.DTimer, "%s, election timeout!", rf.fmtServerInfo())
+				debug.Debug(debug.DInfo, "%s, converting to candidate", rf.fmtServerInfo())
 				rf.Unlock()
 				break followerReceivingHeartbeat
 			}
@@ -585,14 +605,11 @@ followerLoop:
 		// If election timeout elapses without receiving AppendEntries
 		// RPC from current leader or granting vote to candidate:
 		// convert to candidate(Fig. 2)
-		rf.Lock()
-		debug.Debug(debug.DInfo, "%s, convert to candidate", rf.fmtServerInfo())
-		rf.state = candidateState
-		rf.Unlock()
 
 	candidateElection:
 		for !rf.killed() {
 			rf.Lock()
+			rf.state = candidateState
 			rf.currentTerm++
 			rf.votedFor = rf.me
 			debug.Debug(debug.DInfo, "%s, start election", rf.fmtServerInfo())
@@ -601,8 +618,7 @@ followerLoop:
 			timer.Reset(electionTimeout)
 			// Send RequestVote RPCs to all other servers
 			elect := make(chan int)
-			quitReqVotes := make(chan int)
-			go rf.sendRequestVoteToAll(elect, quitReqVotes)
+			go rf.sendRequestVoteToAll(elect, electionTimeout)
 			for !rf.killed() {
 				select {
 				case <-elect:
@@ -621,7 +637,6 @@ followerLoop:
 					if rf.state == followerState {
 						timer.Stop()
 						rf.Unlock()
-						quitReqVotes <- 1
 						continue followerLoop
 					}
 					rf.Unlock()
@@ -635,23 +650,26 @@ followerLoop:
 					rf.Lock()
 					debug.Debug(debug.DTimer, "%s, start new election",
 						rf.fmtServerInfo())
+					if rf.state == followerState {
+						rf.Unlock()
+						continue followerLoop
+					}
 					rf.Unlock()
-					quitReqVotes <- 1
 					continue candidateElection
 				}
 			}
 		}
 
 		rf.Lock()
+		// leader 只能由 candidate 转变而来
+		if rf.state != candidateState {
+			rf.Unlock()
+			continue followerLoop
+		}
 		rf.state = leaderState
 		debug.Debug(debug.DLeader, "S%d become leader in term %d", rf.me, rf.currentTerm)
 		rf.Unlock()
-		quitHeartbeat := make(chan int)
-		rf.Lock()
-		debug.Debug(debug.DLog, "%s, first sending heartbeat", rf.fmtServerInfo())
-		rf.Unlock()
-		go rf.sendHeartbeatToAll(quitHeartbeat)
-		timer = time.NewTimer(heartbeatInterval) // 立刻发送心跳
+		timer = time.NewTimer(0) // 立刻发送心跳
 	leaderHeartbeatLoop:
 		for !rf.killed() {
 			select {
@@ -659,17 +677,16 @@ followerLoop:
 				rf.Lock()
 				if rf.state == followerState {
 					timer.Stop()
+					debug.Debug(debug.DLeader, "%s, convert from leader, exiting", rf.fmtServerInfo())
 					rf.Unlock()
-					quitHeartbeat <- 1
 					break leaderHeartbeatLoop
 				}
 				rf.Unlock()
 			case <-timer.C:
-				quitHeartbeat <- 1
 				rf.Lock()
 				debug.Debug(debug.DLog, "%s, sending heartbeat", rf.fmtServerInfo())
 				rf.Unlock()
-				go rf.sendHeartbeatToAll(quitHeartbeat)
+				go rf.sendHeartbeatToAll()
 				timer.Reset(heartbeatInterval)
 			}
 		}
