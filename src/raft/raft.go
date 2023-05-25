@@ -196,15 +196,15 @@ type RequestVoteReply struct {
 	VoteGranted bool // true means candidate received vote
 }
 
-func fmtLogs(logs []LogEntry) string {
+// this doesn't hold lock
+func fmtLogs(logs []LogEntry, start int) string {
 	ret := "["
 	for i, log := range logs {
-		if i > 0 {
-			ret += fmt.Sprintf("(%d,%d)", i, log.Term)
-		}
+		ret += fmt.Sprintf("(%d,%d,%v)", start, log.Term, log.Command)
 		if i != len(logs)-1 {
 			ret += ","
 		}
+		start++
 	}
 	ret += "]"
 
@@ -213,7 +213,8 @@ func fmtLogs(logs []LogEntry) string {
 
 // this doesn't hold lock
 func (rf *Raft) fmtServerInfo() string {
-	return fmt.Sprintf("S%d %s (votedFor=%d,term=%d)\nlogs=%s", rf.me, rf.state, rf.votedFor, rf.currentTerm, fmtLogs(rf.log))
+	return fmt.Sprintf("S%d %s (votedFor=%d,term=%d,logs=%s)",
+		rf.me, rf.state, rf.votedFor, rf.currentTerm, fmtLogs(rf.log[1:], 1))
 }
 
 type logSlot struct {
@@ -221,11 +222,11 @@ type logSlot struct {
 	logIndex int
 }
 
-func (l *logSlot) String() string {
-	return fmt.Sprintf("(%d,%d)", l.term, l.logIndex)
+func (l logSlot) String() string {
+	return fmt.Sprintf("(%d,%d)", l.logIndex, l.term)
 }
 
-func (a *logSlot) newerThan(b *logSlot) bool {
+func (a logSlot) newerThan(b *logSlot) bool {
 	if a.term != b.term {
 		return a.term > b.term
 	}
@@ -269,7 +270,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateId
 			debug.Debug(debug.DVote, "%s, voted to S%d Candidate", rf.fmtServerInfo(), args.CandidateId)
 		} else {
-			debug.Debug(debug.DVote, "%s, election restriction: candidate%s;receiver%s",
+			debug.Debug(debug.DVote, "%s, election restriction on S%d: candidate%s;receiver%s",
 				rf.fmtServerInfo(), args.CandidateId, candidateLog, receiverLog)
 		}
 	}
@@ -323,9 +324,10 @@ func (rf *Raft) sendRequestVoteToAll(elected chan<- int, timeout time.Duration) 
 		rf.Lock()
 		if rf.state == candidateState {
 			args := RequestVoteArgs{
-				Term:        rf.currentTerm,
-				CandidateId: rf.me,
-				// TODO
+				Term:         rf.currentTerm,
+				CandidateId:  rf.me,
+				LastLogIndex: len(rf.log) - 1,
+				LastLogTerm:  rf.log[len(rf.log)-1].Term,
 			}
 			go rf.callRequestVoteChan(i, &args, replyChan)
 		} else if rf.state == followerState {
@@ -406,8 +408,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		debug.Debug(debug.DLog, "%s, received hearbeat from S%d Leader(term %d)",
 			rf.fmtServerInfo(), args.LeaderId, args.Term)
 	} else {
-		debug.Debug(debug.DLog2, "%s, received AppendEntries from S%d Leader(term %d)",
-			rf.fmtServerInfo(), args.LeaderId, args.Term)
+		debug.Debug(debug.DLog2, "%s, received AppendEntries from S%d Leader(term %d), prev(%d,%d), entries:%s",
+			rf.fmtServerInfo(), args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, fmtLogs(args.Entries, args.PrevLogIndex+1))
 	}
 
 	// Receiver implementation:
@@ -459,21 +461,43 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 		whose term matches prevLogTerm (§5.3)
 	if args.PrevLogIndex >= len(rf.log) ||
 		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		debug.Debug(debug.DTrace, "%s, in AE, none log matches (prevLogIndex,PrevLogTerm)=(%d,%d)",
+			rf.fmtServerInfo(), args.PrevLogIndex, args.PrevLogTerm)
 		rf.Unlock()
 		reply.Success = false
+
+		rf.onRPCChan <- 1
 		return
+	}
+
+	if args.Entries != nil && len(args.Entries) != 0 {
+		debug.Debug(debug.DTrace, "%s, in AE, prevLogIndex%d,PrevLogTerm%d matched",
+			rf.fmtServerInfo(), args.PrevLogIndex, args.PrevLogTerm)
 	}
 
 	// 3.	If an existing entry conflicts with a new one (same index
 	// 		but different terms), delete the existing entry and all that
 	// 		follow it (§5.3)
 	// 现在可以确定 rf.log[prevLogIdx] == args.prevLogTerm
-	rf.log = rf.log[0 : args.PrevLogIndex+1] // [0, prevLogIdx]
-	debug.Debug(debug.DDrop, "%s, dropped rf.log[%d:]", rf.fmtServerInfo(), args.PrevLogIndex+1)
+	i := 0
+	j := args.PrevLogIndex + 1
+	for i < len(args.Entries) && j < len(rf.log) {
+		if rf.log[j].Term != args.Entries[i].Term {
+			rf.log = rf.log[0:j]
+			debug.Debug(debug.DDrop, "%s, dropped rf.log[%d:]", rf.fmtServerInfo(), j)
+			break
+		}
+		i++
+		j++
+	}
 
 	// 4.	Append any new entries not already in the log
-	rf.log = append(rf.log, args.Entries...)
-	debug.Debug(debug.DLog2, "%s", rf.fmtServerInfo())
+	if i < len(args.Entries) {
+		st := len(rf.log)
+		rf.log = append(rf.log, args.Entries[i:]...)
+		debug.Debug(debug.DLog2, "%s appended, where new entries start at %d",
+			rf.fmtServerInfo(), st)
+	}
 
 	// 5.	If leaderCommit > commitIndex, set commitIndex =
 	// 		min(leaderCommit, index of last new entry)
@@ -484,8 +508,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.commitIndex = newEnt
 		}
+		debug.Debug(debug.DLog2, "%s, set commitIdx = %d", rf.fmtServerInfo(), rf.commitIndex)
 		// If commitIndex > lastApplied: increment lastApplied, apply
 		// log[lastApplied] to state machine (§5.3) (Fig. 2)
+
 		rf.updateLastApplied()
 	}
 
@@ -505,7 +531,6 @@ type WrappedAppendEntriesReply struct {
 
 func (rf *Raft) callAppendEntriesChan(target int, args *AppendEntriesArgs, ch chan *WrappedAppendEntriesReply) {
 	reply := AppendEntriesReply{}
-	debug.Debug(debug.DLog, "S%d Leader, send heartbeat to S%d", args.LeaderId, target)
 	ok := rf.peers[target].Call("Raft.AppendEntries", args, &reply)
 	select {
 	case ch <- &WrappedAppendEntriesReply{
@@ -535,13 +560,17 @@ func (rf *Raft) sendHeartbeatToAll() {
 		// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 		rf.Lock()
 		if rf.state == leaderState {
-			// args := AppendEntriesArgs{
-			// 	Term:     rf.currentTerm,
-			// 	LeaderId: rf.me,
-			// 	Entries:  nil,
-			// }
-			// TODO args ok?
-			go rf.callAppendEntriesChan(i, rf.getAppendEntriesArgs(i), replyChan)
+			prevLogIndex := rf.nextIndex[i] - 1 // 要发送（新的） log 的前一个
+			prevLogTerm := rf.log[prevLogIndex].Term
+			args := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				Entries:      nil,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				LeaderCommit: rf.commitIndex,
+			}
+			go rf.callAppendEntriesChan(i, &args, replyChan)
 		} else if rf.state == followerState {
 			rf.Unlock()
 			return
@@ -600,6 +629,7 @@ func (rf *Raft) getAppendEntriesArgs(target int) *AppendEntriesArgs {
 		Entries:      rf.log[rf.nextIndex[target]:],
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
+		LeaderCommit: rf.commitIndex,
 	}
 
 	return &args
@@ -620,7 +650,12 @@ func (rf *Raft) sendAppendEntriesToall() {
 			// If last log index ≥ nextIndex for a follower: send
 			// AppendEntries RPC with log entries starting at nextIndex (Fig. 2)
 			if len(rf.log)-1 >= rf.nextIndex[i] {
+				// debug.Debug(debug.DLog, "%s, last log index(%d) >= nextIndex(%d) for S%d",
+				// 	rf.fmtServerInfo(), len(rf.log)-1, rf.nextIndex[i], i)
 				go rf.callAppendEntriesChan(i, rf.getAppendEntriesArgs(i), replyChan)
+			} else {
+				debug.Debug(debug.DLog, "%s, last log index(%d) < nextIndex(%d) for S%d",
+					rf.fmtServerInfo(), len(rf.log)-1, rf.nextIndex[i], i)
 			}
 		} else if rf.state == followerState {
 			rf.Unlock()
@@ -642,13 +677,12 @@ func (rf *Raft) sendAppendEntriesToall() {
 		select {
 		case wrReply = <-replyChan:
 			if wrReply.ok {
-				replyCnt++ // TODO rpc 成功还是 reply.success ？
 				reply := wrReply.reply
 				rf.Lock()
 				// 任何时候 term > rf.currentTerm 都要这么做
 				if reply.Term > rf.currentTerm {
 					debug.Debug(debug.DLeader, "%s, reply term(%d) > curTerm, convert to follower",
-						rf.fmtServerInfo(), reply.Term)
+					rf.fmtServerInfo(), reply.Term)
 					rf.currentTerm = reply.Term
 					rf.resetToFollower()
 					rf.Unlock()
@@ -657,12 +691,13 @@ func (rf *Raft) sendAppendEntriesToall() {
 				// 只有 leader 才有以下行为
 				if rf.state == leaderState {
 					if reply.Success {
+						replyCnt++ // TODO rpc 成功还是 reply.success ？
+						debug.Debug(debug.DInfo, "%s, AE reply.Success=true", rf.fmtServerInfo())
 						// If successful: update nextIndex and matchIndex for
 						// follower (§5.3) (Fig. 2)
 						target := wrReply.from
-						logNum := len(wrReply.args.Entries)
-						rf.nextIndex[target] += logNum
-						rf.matchIndex[target] = rf.nextIndex[target] - 1
+						rf.nextIndex[target] = wrReply.args.PrevLogIndex + len(wrReply.args.Entries) + 1
+						rf.matchIndex[target] = wrReply.args.PrevLogIndex + len(wrReply.args.Entries)
 						// If there exists an N such that N > commitIndex, a majority
 						// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 						// set commitIndex = N (§5.3, §5.4) (Fig. 2)
@@ -688,6 +723,7 @@ func (rf *Raft) sendAppendEntriesToall() {
 						// decrement nextIndex and retry (§5.3)
 						// 注意首个 log index 为 1
 						if rf.nextIndex[wrReply.from] > 1 {
+							debug.Debug(debug.DLog2, "%s, nextIndex[%d]--", rf.fmtServerInfo(), wrReply.from)
 							rf.nextIndex[wrReply.from]--
 						}
 						go rf.callAppendEntriesChan(wrReply.from, rf.getAppendEntriesArgs(wrReply.from), replyChan)
@@ -709,6 +745,7 @@ func (rf *Raft) sendAppendEntriesToall() {
 	}
 }
 
+// this doesn't hold lock!
 func (rf *Raft) updateLastApplied() {
 	if rf.commitIndex > rf.lastApplied {
 		// 上次提交的下一个 log 到 commitIdx
@@ -721,6 +758,7 @@ func (rf *Raft) updateLastApplied() {
 			}
 			rf.appMsgBuffer = append(rf.appMsgBuffer, &appMsg)
 		}
+		debug.Debug(debug.DTrace, "%s, appMsg appended", rf.fmtServerInfo())
 		rf.lastApplied = rf.commitIndex
 		rf.appMsgCond.Signal()
 	}
@@ -786,6 +824,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
 		rf.matchIndex[rf.me] = len(rf.log) - 1
 		rf.nextIndex[rf.me] = len(rf.log)
+		debug.Debug(debug.DLog2, "%s, received command, sending AE to all", rf.fmtServerInfo())
 		go rf.sendAppendEntriesToall()
 	}
 	// 例如原来 leader 的 log 槽位：0 1 2 3 (len 4)
@@ -948,9 +987,11 @@ followerLoop:
 				rf.Unlock()
 			case <-timer.C:
 				rf.Lock()
-				debug.Debug(debug.DLog, "%s, sending heartbeat", rf.fmtServerInfo())
+				if rf.state == leaderState {
+					debug.Debug(debug.DLog, "%s, sending heartbeat to all", rf.fmtServerInfo())
+					go rf.sendHeartbeatToAll()
+				}
 				rf.Unlock()
-				go rf.sendHeartbeatToAll()
 				timer.Reset(heartbeatInterval)
 			}
 		}
@@ -989,6 +1030,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			msg := rf.appMsgBuffer[0]
 			rf.appMsgBuffer = rf.appMsgBuffer[1:]
 			rf.Unlock()
+			debug.Debug(debug.DTrace, "%s, wrote applyCh", rf.fmtServerInfo())
 			applyCh <- *msg
 		}
 	}()
