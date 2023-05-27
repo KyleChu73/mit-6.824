@@ -66,7 +66,23 @@ coordinator 端会维护一个任务队列（线程安全的），可以理解�
 
 **结果：**
 
-通过一万次测试
+```shell
+$ time go test -run 2A
+Test (2A): initial election ...
+  ... Passed --   3.0  3   58   14992    0
+Test (2A): election after network failure ...
+  ... Passed --   4.4  3  123   23290    0
+Test (2A): multiple elections ...
+  ... Passed --   5.8  7  636  117958    0
+PASS
+ok      6.824/raft      13.268s
+
+real    0m13.418s
+user    0m0.400s
+sys     0m0.137s
+```
+
+用 dstest 进行多轮测试，通过一万次测试：
 
 ![image-20230521111413992](README.assets/image-20230521111413992.png)
 
@@ -114,3 +130,101 @@ func TestMain(m *testing.M) {
 ```
 
 然而测试代码本身就有一些泄露，但我不打算更改测试代码。
+
+### Part 2B: log 
+
+**结果：**
+
+```shell
+$ time go test -run 2B
+Test (2B): basic agreement ...
+  ... Passed --   0.6  3   16    4142    3
+Test (2B): RPC byte count ...
+  ... Passed --   1.5  3   48  113114   11
+Test (2B): agreement after follower reconnects ...
+  ... Passed --   5.5  3  135   33608    8
+Test (2B): no agreement if too many followers disconnect ...
+  ... Passed --   3.4  5  214   43276    3
+Test (2B): concurrent Start()s ...
+  ... Passed --   0.5  3   20    5615    6
+Test (2B): rejoin of partitioned leader ...
+  ... Passed --   5.8  3  185   43674    4
+Test (2B): leader backs up quickly over incorrect follower logs ...
+  ... Passed --  14.6  5 2963 2344810  102
+Test (2B): RPC counts aren't too high ...
+  ... Passed --   2.0  3   60   17354   12
+PASS
+ok      6.824/raft      33.977s
+
+real    0m34.159s
+user    0m1.139s
+sys     0m0.607s
+```
+
+用 dstest 进行多轮测试，通过一千次测试（由于一万次过于耗时，这里先进行一千次……）：
+
+![image-20230527212008654](README.assets/image-20230527212008654.png)
+
+**注意点：**
+
+- 对于所有服务器：“If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)”，也就是说 commitIndex 更新时应做这个检查
+  - leader 会 主动更新 commitIndex：“If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4)”
+  - follower 在收到 AppendEntries RPC 的时候更新 commitIndex：“5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)”
+- 必须实现选举限制：“RequestVote RPC实现了这一限制：RPC包括关于候选人日志的信息，如果投票人自己的日志比候选人的日志更新时，则拒绝投票。”
+
+- `nextIndex[i]`的更新逻辑应为：`rf.nextIndex[target] = wrReply.args.PrevLogIndex + len(wrReply.args.Entries) + 1`，而不是用`len(wrReply.args.Entries)`直接递增。因为先后两次收到 `Entries=(1,1)` 、 `Entries=(1,1),(2,1)` 的 AE RPC 和一次性收到  `Entries=(1,1),(2,1)` ，`nextIndex[i]`的值应该是相同的
+
+**其他：**
+
+我在 debug TestRejoin2B 的过程中遇到的问题（下图是一个错误）：
+
+![image-20230527142434895](README.assets/TestRejoin2B.png)
+
+图中 S1 是一个离开集群一段时间的旧 leader，现在真正的 leader 是 S2，它的任期是 3，commitIndex 为 3，S2 的 log 为：
+
+```text
+index: 1   2   3
+       -----------
+term:  1   2   3
+cmd:   101 103 104
+```
+
+S1 的 commitIndex 为 2，S1 的 log 为：
+
+```text
+index: 1   2   3
+       -----------
+term:  1   2   2
+cmd:   101 103 105
+```
+
+那么这个判断：If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)，显然是不能被执行的，所以这里把 AE 作为心跳时的 prevLogIndex 置为 leader 最新的 log，即 `prevLogIndex := len(rf.log) - 1` ，即 3，那么这个 AE 就会被回复失败而不会走到这一步。
+
+另一个值得注意的问题是，follower 可能收到历史的 AE，例如，某个 follower 的 log 现在为：
+
+```text
+index: 1   2   3
+       -----------
+term:  1   1   1
+```
+
+且都已提交，此后他收到一个历史 AE，Entries 可能是后面两个 log 条目，那么这个 follower 必须不把任何条目删除。我的实现如下：
+
+```go
+i := 0
+j := args.PrevLogIndex + 1
+for i < len(args.Entries) && j < len(rf.log) {
+    if rf.log[j].Term != args.Entries[i].Term {
+        rf.log = rf.log[0:j]
+        break
+    }
+    i++
+    j++
+}
+
+if i < len(args.Entries) {
+    st := len(rf.log)
+    rf.log = append(rf.log, args.Entries[i:]...)
+}
+```
+
