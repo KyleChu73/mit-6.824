@@ -200,7 +200,13 @@ type RequestVoteReply struct {
 func fmtLogs(logs []LogEntry, start int) string {
 	ret := "["
 	for i, log := range logs {
-		ret += fmt.Sprintf("(%d,%d,%v)", start, log.Term, log.Command)
+		cmd := fmt.Sprintf("%v", log.Command)
+		l := len(cmd)
+		if l > 3 {
+			cmd = cmd[:3]
+			cmd += "…"
+		}
+		ret += fmt.Sprintf("(%d,%d)", start, log.Term)
 		if i != len(logs)-1 {
 			ret += ","
 		}
@@ -283,9 +289,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 // this doesn't own lock!
 func (rf *Raft) resetToFollower() {
-	if rf.state != followerState {
-		debug.Debug(debug.DTerm, "%s, convert to follower", rf.fmtServerInfo())
-	}
+	// if rf.state != followerState {
+	// 	debug.Debug(debug.DTerm, "%s, convert to follower", rf.fmtServerInfo())
+	// }
 	rf.state = followerState
 	rf.votedFor = -1
 }
@@ -403,14 +409,6 @@ type AppendEntriesReply struct {
 // 作为一个 condidate 收到：如果是一个更新的 leader，转换成 follower
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.Lock()
-	// empty for heartbeat
-	if args.Entries == nil || len(args.Entries) == 0 {
-		debug.Debug(debug.DLog, "%s, received hearbeat from S%d Leader(term %d)",
-			rf.fmtServerInfo(), args.LeaderId, args.Term)
-	} else {
-		debug.Debug(debug.DLog2, "%s, received AppendEntries from S%d Leader(term %d), prev(%d,%d), entries:%s",
-			rf.fmtServerInfo(), args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, fmtLogs(args.Entries, args.PrevLogIndex+1))
-	}
 
 	// Receiver implementation:
 	// 1.	Reply false if term < currentTerm (§5.1)
@@ -431,6 +429,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.Unlock()
 		reply.Success = false
 		return
+	}
+
+	// empty for heartbeat
+	if args.Entries == nil || len(args.Entries) == 0 {
+		debug.Debug(debug.DLog, "%s, received heartbeat from S%d Leader(term %d)",
+			rf.fmtServerInfo(), args.LeaderId, args.Term)
+	} else {
+		debug.Debug(debug.DLog2, "%s, received AppendEntries from S%d Leader(term %d), prev(%d,%d), entries:%s",
+			rf.fmtServerInfo(), args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, fmtLogs(args.Entries, args.PrevLogIndex+1))
 	}
 
 	// If RPC request or response contains term T > currentTerm:
@@ -560,7 +567,7 @@ func (rf *Raft) sendHeartbeatToAll() {
 		// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 		rf.Lock()
 		if rf.state == leaderState {
-			prevLogIndex := rf.nextIndex[i] - 1 // 要发送（新的） log 的前一个
+			prevLogIndex := len(rf.log) - 1
 			prevLogTerm := rf.log[prevLogIndex].Term
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
@@ -682,7 +689,7 @@ func (rf *Raft) sendAppendEntriesToall() {
 				// 任何时候 term > rf.currentTerm 都要这么做
 				if reply.Term > rf.currentTerm {
 					debug.Debug(debug.DLeader, "%s, reply term(%d) > curTerm, convert to follower",
-					rf.fmtServerInfo(), reply.Term)
+						rf.fmtServerInfo(), reply.Term)
 					rf.currentTerm = reply.Term
 					rf.resetToFollower()
 					rf.Unlock()
@@ -1029,8 +1036,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			// non-empty
 			msg := rf.appMsgBuffer[0]
 			rf.appMsgBuffer = rf.appMsgBuffer[1:]
-			rf.Unlock()
 			debug.Debug(debug.DTrace, "%s, wrote applyCh", rf.fmtServerInfo())
+			rf.Unlock()
 			applyCh <- *msg
 		}
 	}()
