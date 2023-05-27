@@ -607,6 +607,16 @@ func (rf *Raft) sendHeartbeatToAll() {
 					rf.Unlock()
 					return
 				}
+				
+				// 说明 prevLogIndex,prevLogTerm 不匹配
+				// 这里可以选择发送 AE
+				if !reply.Success && rf.state == leaderState {
+					if rf.nextIndex[wrReply.from] > 1 {
+						debug.Debug(debug.DLog2, "%s, nextIndex[%d]--", rf.fmtServerInfo(), wrReply.from)
+						rf.nextIndex[wrReply.from]--
+					}
+					go rf.callAppendEntriesChan(wrReply.from, rf.getAppendEntriesArgs(wrReply.from), replyChan)
+				}
 				rf.Unlock()
 			}
 		case <-timer.C:
@@ -630,10 +640,12 @@ func (rf *Raft) getAppendEntriesArgs(target int) *AppendEntriesArgs {
 	//          ^ become leader
 	prevLogIndex := rf.nextIndex[target] - 1 // 要发送（新的） log 的前一个
 	prevLogTerm := rf.log[prevLogIndex].Term
+	entries := make([]LogEntry, len(rf.log)-rf.nextIndex[target])
+	copy(entries, rf.log[rf.nextIndex[target]:])
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
-		Entries:      rf.log[rf.nextIndex[target]:],
+		Entries:      entries,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
 		LeaderCommit: rf.commitIndex,
@@ -742,12 +754,15 @@ func (rf *Raft) sendAppendEntriesToall() {
 				rf.Lock()
 				// 时刻注意 leader 可能已转为 follower
 				if rf.state == leaderState {
-					go rf.callAppendEntriesChan(wrReply.from, wrReply.args, replyChan)
+					// wrReply.args or rf.getAppendEntriesArgs ?
+					go rf.callAppendEntriesChan(wrReply.from, rf.getAppendEntriesArgs(wrReply.from), replyChan)
 				}
 				rf.Unlock()
 			}
 		case <-timer.C:
-			timer.Reset(heartbeatInterval)
+			if !timer.Reset(heartbeatInterval) {
+				timer = time.NewTimer(heartbeatInterval)
+			}
 		}
 	}
 }
@@ -891,7 +906,9 @@ followerLoop:
 			select {
 			case <-rf.onRPCChan:
 				electionTimeout = randomElectionTimeout()
-				timer.Reset(electionTimeout)
+				if !timer.Reset(electionTimeout) {
+					timer = time.NewTimer(electionTimeout)
+				}
 				rf.Lock()
 				debug.Debug(debug.DTimer, "%s, reset election timeout(%d ms)",
 					rf.fmtServerInfo(), electionTimeout/time.Millisecond)
@@ -917,7 +934,9 @@ followerLoop:
 			debug.Debug(debug.DInfo, "%s, start election", rf.fmtServerInfo())
 			rf.Unlock()
 			electionTimeout = randomElectionTimeout()
-			timer.Reset(electionTimeout)
+			if !timer.Reset(electionTimeout) {
+				timer = time.NewTimer(electionTimeout)
+			}
 			// Send RequestVote RPCs to all other servers
 			elect := make(chan int)
 			go rf.sendRequestVoteToAll(elect, electionTimeout)
@@ -999,7 +1018,9 @@ followerLoop:
 					go rf.sendHeartbeatToAll()
 				}
 				rf.Unlock()
-				timer.Reset(heartbeatInterval)
+				if !timer.Reset(heartbeatInterval) {
+					timer = time.NewTimer(heartbeatInterval)
+				}
 			}
 		}
 	}
