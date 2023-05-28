@@ -146,6 +146,7 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	debug.Debug(debug.DPersist, "S%d, persisting", rf.me)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -173,6 +174,7 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	debug.Debug(debug.DPersist, "S%d, reading persist", rf.me)
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
@@ -285,6 +287,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
+		rf.persist()
 		rf.Unlock()
 		return
 	}
@@ -311,6 +314,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.Term = rf.currentTerm
+	rf.persist()
 	rf.Unlock()
 
 	rf.onRPCChan <- 1
@@ -460,6 +464,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// If a server receives a request with a stale term
 	// number, it rejects the request. (§5.1)
 	if args.Term < rf.currentTerm {
+		rf.persist()
 		rf.Unlock()
 		reply.Success = false
 		return
@@ -526,6 +531,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		debug.Debug(debug.DLog2, "%s, fast backup: XTerm=%d, XIndex=%d, XLen=%d",
 			rf.fmtServerInfo(), reply.XTerm, reply.XIndex, reply.XLen)
+		rf.persist()
 		rf.Unlock()
 		reply.Success = false
 
@@ -578,6 +584,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.updateLastApplied()
 	}
 
+	rf.persist()
 	rf.Unlock()
 
 	reply.Success = true
@@ -1137,6 +1144,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			msg := rf.appMsgBuffer[0]
 			rf.appMsgBuffer = rf.appMsgBuffer[1:]
 			debug.Debug(debug.DTrace, "%s, wrote applyCh", rf.fmtServerInfo())
+			rf.persist()
 			rf.Unlock()
 			applyCh <- *msg
 		}
