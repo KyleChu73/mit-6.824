@@ -20,7 +20,9 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -28,6 +30,7 @@ import (
 
 	//	"6.824/labgob"
 	"6.824/debug"
+	"6.824/labgob"
 	"6.824/labrpc"
 	"github.com/sasha-s/go-deadlock"
 )
@@ -56,6 +59,10 @@ type ApplyMsg struct {
 type LogEntry struct {
 	Term    int
 	Command interface{}
+}
+
+func init() {
+	labgob.Register(LogEntry{})
 }
 
 // A Go object implementing a single Raft peer.
@@ -129,6 +136,7 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
+// this function doesn't hold lock!
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -138,6 +146,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -158,6 +173,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logEntries []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logEntries) != nil {
+		log.Fatalf("readPersist: decode failed\n")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = logEntries
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -607,7 +636,7 @@ func (rf *Raft) sendHeartbeatToAll() {
 					rf.Unlock()
 					return
 				}
-				
+
 				// 说明 prevLogIndex,prevLogTerm 不匹配
 				// 这里可以选择发送 AE
 				if !reply.Success && rf.state == leaderState {
