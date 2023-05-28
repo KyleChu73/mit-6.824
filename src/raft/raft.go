@@ -432,6 +432,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // currentTerm, for leader to update itself
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+
+	// fast backup
+	XTerm  int // Follower 中与 Leader 冲突的 Log 对应的任期号，Leader 会在 prevLogTerm 中带上本地 Log 记录中，前一条Log的任期号。如果Follower在对应位置的任期号不匹配，它会拒绝Leader的AppendEntries消息，并将自己的任期号放在XTerm中。如果Follower在对应位置没有Log，那么这里会返回 -1。
+	XIndex int // Follower 中，对应任期号为 XTerm 的第一条 Log 条目的槽位号。
+	XLen   int // 如果 Follower 在对应位置没有 Log，那么 XTerm 会返回 -1，XLen 表示空白的 Log 槽位数。
 }
 
 // 作为一个 follower 收到：心跳或日志
@@ -499,6 +504,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		debug.Debug(debug.DTrace, "%s, in AE, none log matches (prevLogIndex,PrevLogTerm)=(%d,%d)",
 			rf.fmtServerInfo(), args.PrevLogIndex, args.PrevLogTerm)
+		if args.PrevLogIndex >= len(rf.log) {
+			reply.XTerm = -1
+			reply.XLen = args.PrevLogIndex - len(rf.log) + 1
+		} else {
+			XTerm := rf.log[args.PrevLogIndex].Term
+			reply.XTerm = XTerm
+			l, r := 0, len(rf.log)-1
+			for l < r {
+				mid := l + (r-l)/2
+				if rf.log[mid].Term >= XTerm {
+					r = mid
+				} else {
+					l = mid + 1
+				}
+			}
+			if rf.log[l].Term != XTerm {
+				log.Fatalf("AppendEntries: bin search error!\n")
+			}
+			reply.XIndex = l
+		}
+		debug.Debug(debug.DLog2, "%s, fast backup: XTerm=%d, XIndex=%d, XLen=%d",
+			rf.fmtServerInfo(), reply.XTerm, reply.XIndex, reply.XLen)
 		rf.Unlock()
 		reply.Success = false
 
@@ -640,10 +667,11 @@ func (rf *Raft) sendHeartbeatToAll() {
 				// 说明 prevLogIndex,prevLogTerm 不匹配
 				// 这里可以选择发送 AE
 				if !reply.Success && rf.state == leaderState {
-					if rf.nextIndex[wrReply.from] > 1 {
-						debug.Debug(debug.DLog2, "%s, nextIndex[%d]--", rf.fmtServerInfo(), wrReply.from)
-						rf.nextIndex[wrReply.from]--
-					}
+					// if rf.nextIndex[wrReply.from] > 1 {
+					// 	debug.Debug(debug.DLog2, "%s, nextIndex[%d]--", rf.fmtServerInfo(), wrReply.from)
+					// 	rf.nextIndex[wrReply.from]--
+					// }
+					rf.updateNextIndex(wrReply)
 					go rf.callAppendEntriesChan(wrReply.from, rf.getAppendEntriesArgs(wrReply.from), replyChan)
 				}
 				rf.Unlock()
@@ -770,10 +798,11 @@ func (rf *Raft) sendAppendEntriesToall() {
 						// If AppendEntries fails because of log inconsistency:
 						// decrement nextIndex and retry (§5.3)
 						// 注意首个 log index 为 1
-						if rf.nextIndex[wrReply.from] > 1 {
-							debug.Debug(debug.DLog2, "%s, nextIndex[%d]--", rf.fmtServerInfo(), wrReply.from)
-							rf.nextIndex[wrReply.from]--
-						}
+						// if rf.nextIndex[wrReply.from] > 1 {
+						// 	debug.Debug(debug.DLog2, "%s, nextIndex[%d]--", rf.fmtServerInfo(), wrReply.from)
+						// 	rf.nextIndex[wrReply.from]--
+						// }
+						rf.updateNextIndex(wrReply)
 						go rf.callAppendEntriesChan(wrReply.from, rf.getAppendEntriesArgs(wrReply.from), replyChan)
 					}
 				}
@@ -794,6 +823,27 @@ func (rf *Raft) sendAppendEntriesToall() {
 			}
 		}
 	}
+}
+
+// this function doesn't hold lock!
+func (rf *Raft) updateNextIndex(wrReply *WrappedAppendEntriesReply) {
+	oldIdx := rf.nextIndex[wrReply.from]
+	reply := wrReply.reply
+	if reply.XTerm == -1 {
+		rf.nextIndex[wrReply.from] -= reply.XLen
+		if rf.nextIndex[wrReply.from] < 1 {
+			rf.nextIndex[wrReply.from] = 1
+		}
+	} else {
+		if rf.log[reply.XIndex].Term != reply.XTerm {
+			rf.nextIndex[wrReply.from] = reply.XIndex
+		} else {
+			rf.nextIndex[wrReply.from] = reply.XIndex + 1
+		}
+	}
+	newIdx := rf.nextIndex[wrReply.from]
+	debug.Debug(debug.DLog2, "S%d, nextIndex[%d]: %d -> %d",
+		rf.me, wrReply.from, oldIdx, newIdx)
 }
 
 // this doesn't hold lock!
