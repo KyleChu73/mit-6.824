@@ -867,18 +867,6 @@ func (rf *Raft) updateNextIndex(wrReply *WrappedAppendEntriesReply) {
 // this doesn't hold lock!
 func (rf *Raft) updateLastApplied() {
 	if rf.commitIndex > rf.lastApplied {
-		// 上次提交的下一个 log 到 commitIdx
-		applyLogs := rf.log[rf.lastApplied+1 : rf.commitIndex+1]
-		for i, ent := range applyLogs {
-			appMsg := ApplyMsg{
-				CommandValid: true,
-				Command:      ent.Command,
-				CommandIndex: rf.lastApplied + 1 + i,
-			}
-			rf.appMsgBuffer = append(rf.appMsgBuffer, &appMsg)
-		}
-		debug.Debug(debug.DTrace, "%s, appMsg appended", rf.fmtServerInfo())
-		rf.lastApplied = rf.commitIndex
 		rf.appMsgCond.Signal()
 	}
 }
@@ -1145,21 +1133,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.onRPCChan = make(chan int)
 	rf.appMsgBuffer = make([]*ApplyMsg, 0)
 	rf.appMsgCond = sync.NewCond(&rf.Mutex)
-	go func() {
-		for !rf.killed() {
-			rf.Lock()
-			for len(rf.appMsgBuffer) == 0 {
-				rf.appMsgCond.Wait()
-			}
-			// non-empty
-			msg := rf.appMsgBuffer[0]
-			rf.appMsgBuffer = rf.appMsgBuffer[1:]
-			debug.Debug(debug.DTrace, "%s, wrote applyCh", rf.fmtServerInfo())
-			rf.persist()
-			rf.Unlock()
-			applyCh <- *msg
-		}
-	}()
 
 	rf.currentTerm = 0
 	rf.votedFor = -1 // null
@@ -1181,6 +1154,32 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	go func() {
+		for !rf.killed() {
+			rf.Lock()
+			for rf.commitIndex <= rf.lastApplied {
+				rf.appMsgCond.Wait()
+			}
+			// now rf.commitIndex > rf.lastApplied
+			// 上次提交的下一个 log 到 commitIdx
+			ent := rf.log[rf.lastApplied+1]
+			appMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      ent.Command,
+				CommandIndex: rf.lastApplied + 1,
+			}
+			rf.Unlock()
+			
+			// apply
+			applyCh <- appMsg
+			
+			rf.Lock()
+			rf.lastApplied++
+			rf.persist()
+			rf.Unlock()
+		}
+	}()
 
 	return rf
 }
