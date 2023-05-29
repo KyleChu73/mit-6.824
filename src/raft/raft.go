@@ -239,7 +239,7 @@ func fmtLogs(logs []LogEntry, start int) string {
 			cmd += "…"
 		}
 		if i < 2 || len(logs)-i <= 5 {
-			ret += fmt.Sprintf("%d", log.Term)
+			ret += fmt.Sprintf("%d:%s", log.Term, cmd)
 			if i != len(logs)-1 {
 				ret += ","
 			}
@@ -247,7 +247,7 @@ func fmtLogs(logs []LogEntry, start int) string {
 			if !blbl {
 				ret += "…"
 				if i != len(logs)-1 {
-					ret += ","
+					ret += ", "
 				}
 				blbl = true
 			}
@@ -261,7 +261,7 @@ func fmtLogs(logs []LogEntry, start int) string {
 
 // this doesn't hold lock
 func (rf *Raft) fmtServerInfo() string {
-	return fmt.Sprintf("S%d %s (term=%d,logs=%s)",
+	return fmt.Sprintf("S%d %s (term=%d, logs=%s)",
 		rf.me, rf.state, rf.currentTerm, fmtLogs(rf.log[1:], 1))
 }
 
@@ -298,7 +298,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		rf.persist()
 		rf.Unlock()
 		return
 	}
@@ -310,6 +309,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.fmtServerInfo(), rf.currentTerm, args.Term)
 		rf.currentTerm = args.Term
 		rf.resetToFollower() // 一定要重置
+		rf.persist()
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		candidateLog := logSlot{args.LastLogTerm, args.LastLogIndex}
@@ -318,6 +318,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 			debug.Debug(debug.DVote, "%s, voted to S%d Candidate", rf.fmtServerInfo(), args.CandidateId)
+			rf.persist()
 		} else {
 			debug.Debug(debug.DVote, "%s, election restriction on S%d: candidate%s;receiver%s",
 				rf.fmtServerInfo(), args.CandidateId, candidateLog, receiverLog)
@@ -325,7 +326,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.Term = rf.currentTerm
-	rf.persist()
 	rf.Unlock()
 
 	rf.onRPCChan <- 1
@@ -403,6 +403,7 @@ func (rf *Raft) sendRequestVoteToAll(elected chan<- int, timeout time.Duration) 
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.resetToFollower()
+					rf.persist()
 					rf.Unlock()
 					return
 				}
@@ -475,7 +476,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// If a server receives a request with a stale term
 	// number, it rejects the request. (§5.1)
 	if args.Term < rf.currentTerm {
-		rf.persist()
 		rf.Unlock()
 		reply.Success = false
 		return
@@ -500,6 +500,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			debug.Debug(debug.DTerm, "%s, convert to follower", rf.fmtServerInfo())
 		}
 		rf.resetToFollower()
+		rf.persist()
 	}
 
 	// If the leader’s term (included in its RPC) is at least
@@ -512,6 +513,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		debug.Debug(debug.DTerm, "%s, convert to follower", rf.fmtServerInfo())
 		rf.resetToFollower()
+		rf.persist()
 	}
 
 	// 2.	Reply false if log doesn’t contain an entry at prevLogIndex
@@ -542,7 +544,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		debug.Debug(debug.DLog2, "%s, fast backup: XTerm=%d, XIndex=%d, XLen=%d",
 			rf.fmtServerInfo(), reply.XTerm, reply.XIndex, reply.XLen)
-		rf.persist()
 		rf.Unlock()
 		reply.Success = false
 
@@ -565,6 +566,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.log[j].Term != args.Entries[i].Term {
 			rf.log = rf.log[0:j]
 			debug.Debug(debug.DDrop, "%s, dropped rf.log[%d:]", rf.fmtServerInfo(), j)
+			rf.persist()
 			break
 		}
 		i++
@@ -577,6 +579,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log = append(rf.log, args.Entries[i:]...)
 		debug.Debug(debug.DLog2, "%s appended, where new entries start at %d",
 			rf.fmtServerInfo(), st)
+		rf.persist()
 	}
 
 	// 5.	If leaderCommit > commitIndex, set commitIndex =
@@ -595,7 +598,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.updateLastApplied()
 	}
 
-	rf.persist()
 	rf.Unlock()
 
 	reply.Success = true
@@ -678,6 +680,7 @@ func (rf *Raft) sendHeartbeatToAll() {
 						rf.fmtServerInfo(), reply.Term)
 					rf.currentTerm = reply.Term
 					rf.resetToFollower()
+					rf.persist()
 					rf.Unlock()
 					return
 				}
@@ -779,6 +782,7 @@ func (rf *Raft) sendAppendEntriesToall() {
 						rf.fmtServerInfo(), reply.Term)
 					rf.currentTerm = reply.Term
 					rf.resetToFollower()
+					rf.persist()
 					rf.Unlock()
 					return
 				}
@@ -932,6 +936,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.matchIndex[rf.me] = len(rf.log) - 1
 		rf.nextIndex[rf.me] = len(rf.log)
 		debug.Debug(debug.DLog2, "%s, received command, sending AE to all", rf.fmtServerInfo())
+		rf.persist()
 		go rf.sendAppendEntriesToall()
 	}
 	// 例如原来 leader 的 log 槽位：0 1 2 3 (len 4)
@@ -1017,6 +1022,7 @@ followerLoop:
 			rf.currentTerm++
 			rf.votedFor = rf.me
 			debug.Debug(debug.DInfo, "%s, start election", rf.fmtServerInfo())
+			rf.persist()
 			rf.Unlock()
 			electionTimeout = randomElectionTimeout()
 			if !timer.Reset(electionTimeout) {
@@ -1169,15 +1175,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				Command:      ent.Command,
 				CommandIndex: rf.lastApplied + 1,
 			}
+			rf.lastApplied++
 			rf.Unlock()
-			
+
 			// apply
 			applyCh <- appMsg
-			
-			rf.Lock()
-			rf.lastApplied++
-			rf.persist()
-			rf.Unlock()
 		}
 	}()
 

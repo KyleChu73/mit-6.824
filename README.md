@@ -2,7 +2,7 @@
 
 连接：[mit-6.824](https://pdos.csail.mit.edu/6.824/schedule.html)
 
-这是一个刚启动 & 进行中的项目，目前完成了：MapReduce，Raft（leader election, log） 
+这是一个进行中的项目，目前完成了：MapReduce，Raft（leader election, log, persistence） 
 
 Most comments in the code are in Chinese. If you need an English translation, please let me know.
 
@@ -228,3 +228,55 @@ if i < len(args.Entries) {
 }
 ```
 
+### Part 2C: persistence
+
+**结果：**
+
+```shell
+$ time go test -run 2C -race
+Test (2C): basic persistence ...
+  ... Passed --   3.4  3   85   21235    6
+Test (2C): more persistence ...
+  ... Passed --  20.6  5 1243  239539   16
+Test (2C): partitioned leader and one follower crash, leader restarts ...
+  ... Passed --   1.6  3   39    9512    4
+Test (2C): Figure 8 ...
+  ... Passed --  33.5  5 1356  287655   55
+Test (2C): unreliable agreement ...
+  ... Passed --   1.7  5 1305  428529  246
+Test (2C): Figure 8 (unreliable) ...
+  ... Passed --  41.1  5 28410 117162718  804
+Test (2C): churn ...
+  ... Passed --  16.1  5 4216 6612976  802
+Test (2C): unreliable churn ...
+  ... Passed --  16.5  5 3675 4355492  552
+PASS
+ok      6.824/raft      134.851s
+
+real    2m15.071s
+user    1m22.464s
+sys     0m4.663s
+```
+
+用 dstest 进行多轮测试：
+
+![image-20230529224120451](README.assets/image-20230529224120451.png)
+
+**实现快速恢复：**
+
+本实验（Lab 2C） [Hints]([6.824 Lab 2: Raft (mit.edu)](http://nil.csail.mit.edu/6.824/2022/labs/lab-raft.html)) 提及要实现快速恢复，具体见 [7.3 快速恢复（Fast Backup）](https://mit-public-courses-cn-translatio.gitbook.io/mit6-824/lecture-07-raft2/7.3-hui-fu-jia-su-backup-acceleration)
+
+主要是给 `AppendEntriesReply` 添加：
+
+- `XTerm`：Follower 中与 Leader 冲突的 Log 对应的任期号。Leader 会在 `prevLogTerm` 中带上本地 Log 记录中，前一条 Log 的任期号。如果 Follower 在对应位置的任期号不匹配，它会拒绝 Leader 的 AppendEntries 消息，并将自己的任期号放在 XTerm 中。如果 Follower 在对应位置没有 Log，那么这里会返回 -1。
+
+- `XIndex`：这个是 Follower 中，对应任期号为 XTerm 的**第一条** Log 条目的槽位号。
+- `XLen`：如果Follower在对应位置没有 Log，那么 XTerm 会返回 -1，XLen 表示**空白的 Log 槽位数**。
+
+**TODO 针对持久化的优化：**
+
+简单的持久化逻辑是在任何修改了 `currentTerm`、`log`、`votedFor` 的地方进行持久化。
+
+[7.4 持久化（Persistence）](https://mit-public-courses-cn-translatio.gitbook.io/mit6-824/lecture-07-raft2/7.4-chi-jiu-hua-persistent)提到：如果你发现，直到服务器与外界通信时，才有可能持久化存储数据，那么你可以通过一些批量操作来提升性能。例如，只在服务器回复一个RPC或者发送一个RPC时，服务器才进行持久化存储，这样可以节省一些持久化存储的操作。
+
+![image-20230528213837172](README.assets/image-20230528213837172.png)
