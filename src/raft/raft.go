@@ -229,7 +229,8 @@ type RequestVoteReply struct {
 
 // this doesn't hold lock
 func fmtLogs(logs []LogEntry, start int) string {
-	ret := "["
+	blbl := false
+	ret := fmt.Sprintf("(%d)", len(logs)) + "["
 	for i, log := range logs {
 		cmd := fmt.Sprintf("%v", log.Command)
 		l := len(cmd)
@@ -237,9 +238,19 @@ func fmtLogs(logs []LogEntry, start int) string {
 			cmd = cmd[:3]
 			cmd += "…"
 		}
-		ret += fmt.Sprintf("(%d,%d)", start, log.Term)
-		if i != len(logs)-1 {
-			ret += ","
+		if i < 2 || len(logs)-i <= 5 {
+			ret += fmt.Sprintf("%d", log.Term)
+			if i != len(logs)-1 {
+				ret += ","
+			}
+		} else {
+			if !blbl {
+				ret += "…"
+				if i != len(logs)-1 {
+					ret += ","
+				}
+				blbl = true
+			}
 		}
 		start++
 	}
@@ -250,8 +261,8 @@ func fmtLogs(logs []LogEntry, start int) string {
 
 // this doesn't hold lock
 func (rf *Raft) fmtServerInfo() string {
-	return fmt.Sprintf("S%d %s (votedFor=%d,term=%d,logs=%s)",
-		rf.me, rf.state, rf.votedFor, rf.currentTerm, fmtLogs(rf.log[1:], 1))
+	return fmt.Sprintf("S%d %s (term=%d,logs=%s)",
+		rf.me, rf.state, rf.currentTerm, fmtLogs(rf.log[1:], 1))
 }
 
 type logSlot struct {
