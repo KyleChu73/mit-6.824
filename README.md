@@ -2,7 +2,7 @@
 
 连接：[mit-6.824](https://pdos.csail.mit.edu/6.824/schedule.html)
 
-这是一个进行中的项目，目前完成了：MapReduce，Raft（leader election, log, persistence） 
+这是一个进行中的项目，目前完成了：MapReduce，Raft（leader election, log, persistence, log compaction） 
 
 Most comments in the code are in Chinese. If you need an English translation, please let me know.
 
@@ -280,3 +280,135 @@ sys     0m4.663s
 [7.4 持久化（Persistence）](https://mit-public-courses-cn-translatio.gitbook.io/mit6-824/lecture-07-raft2/7.4-chi-jiu-hua-persistent)提到：如果你发现，直到服务器与外界通信时，才有可能持久化存储数据，那么你可以通过一些批量操作来提升性能。例如，只在服务器回复一个RPC或者发送一个RPC时，服务器才进行持久化存储，这样可以节省一些持久化存储的操作。
 
 ![image-20230528213837172](README.assets/image-20230528213837172.png)
+
+### Part 2D: log compaction
+
+**结果**
+
+```shell
+$ go test -run 2D -race
+Test (2D): snapshots basic ...
+  ... Passed --   3.5  3  409  172835  211
+Test (2D): install snapshots (disconnect) ...
+  ... Passed --  38.0  3 1707  770259  384
+Test (2D): install snapshots (disconnect+unreliable) ...
+  ... Passed --  44.6  3 1968  908811  342
+Test (2D): install snapshots (crash) ...
+  ... Passed --  27.4  3 1226  652880  329
+Test (2D): install snapshots (unreliable+crash) ...
+  ... Passed --  28.0  3 1387  582865  317
+Test (2D): crash and restart all servers ...
+  ... Passed --   6.7  3  218   65474   48
+PASS
+ok      6.824/raft      148.268s
+```
+
+用 dstest 进行多轮测试：
+
+![image-20230607185537960](README.assets/image-20230607185537960.png)
+
+**Raft 交互图**
+
+![image-20230603214814183](README.assets/image-20230603214814183.png)
+
+Service 层调用 `Snapshot(sm_data)` ，以告知 raft 层已进行快照，他在 `raft.go` 中的签名为：
+
+```go
+func (rf *Raft) Snapshot(index int, snapshot []byte)
+```
+
+具体来讲，这个函数在 Service 层收到一些 applyMsg ，并对他们完成 Snapshot 后调用，也就是服务器独立拍摄快照  ，所以：
+
+- `index`：指的是 `snapshot` 中最新的 log index
+- `snapshot` ：已被 Service 层进行 Snapshot 的日志
+
+另一方面，领导者必须偶尔将快照发送给落后的跟随者（当领导者已经丢弃了它需要发送给跟随者的下一个日志条目时，就会发生这种情况）…… 领导者使用一个名为 InstallSnapshot 的新 RPC 将快照发送给落后太多的追随者。根据上图，收到 InstallSnapshot RPC 的 follower 也需要写 applyCh。
+
+关于这里的 `CondInstallSnapshot`，Hints 中提及：
+
+> Previously, this lab recommended that you implement a function called `CondInstallSnapshot` to avoid the requirement that snapshots and log entries sent on `applyCh` are coordinated. This vestigal API interface remains, but you are discouraged from implementing it: instead, we suggest that you simply have it return true.
+
+所以只要协调好 snapshots 和 log entries 的在 `applyCh` 上的发送，这个函数不用实现。
+
+**封装 `log`**
+
+Hints 中提及：
+
+> You won't be able to store the log in a Go slice and use Go slice indices interchangeably with Raft log indices; you'll need to index the slice in a way that accounts for the discarded portion of the log.
+
+也就是说，对切片进行索引必须考虑日志丢弃部分，所以要对日志获取操作进行分装。比较好的做法是先前的代码就有做封装。
+
+![image-20230603224501359](README.assets/image-20230603224501359.png)
+
+```go
+func (rf *Raft) getLogLen() int {
+	// 这里不减去 1，是为了能直接替换之前实验中的 len(rf.log)
+	return rf.lastIncludedIndex + len(rf.log)
+}
+
+// this function doesn't hold lock
+func (rf *Raft) getLogTerm(index int) int {
+	if index >= rf.getLogLen() {
+		log.Fatalf("getLogTerm: index=%d >= logLen=%d\n", index, rf.getLogLen())
+	}
+
+	if index < rf.lastIncludedIndex {
+		log.Fatalf("getLogTerm: index=%d < lastIncludedIndex=%d\n", index, rf.lastIncludedIndex)
+	} else if index == rf.lastIncludedIndex {
+		return rf.lastIncludedTerm
+	} else {
+		// 注意 log 的 0 位置是个空洞，数据从 1 开始
+		return rf.log[index-rf.lastIncludedIndex].Term
+	}
+
+	// never used, make compiler happy
+	return 0
+}
+
+func (rf *Raft) getLogSlice(begin int) []LogEntry {
+	if begin <= rf.lastIncludedIndex {
+		log.Fatalf("getLogSlice: begin=%d <=  lastIncludedIndex=%d\n", begin, rf.lastIncludedIndex)
+	}
+
+	if begin >= len(rf.log) {
+		return make([]LogEntry, 0)
+	}
+
+	return rf.log[begin-rf.lastIncludedIndex:]
+}
+
+func (rf *Raft) getLog(index int) LogEntry {
+	if index >= rf.getLogLen() {
+		log.Fatalf("getLog: index=%d >= logLen=%d\n", index, rf.getLogLen())
+	}
+
+	if index <= rf.lastIncludedIndex {
+		log.Fatalf("getLog: index=%d <= lastIncludedIndex=%d\n", index, rf.lastIncludedIndex)
+	} else {
+		// 注意 log 的 0 位置是个空洞，数据从 1 开始
+		return rf.log[index-rf.lastIncludedIndex]
+	}
+
+	// never used, make compiler happy
+	return LogEntry{}
+}
+```
+
+**持久化 `lastIncludedTerm/lastIncludedIndex` **
+
+Hints 中提及：
+
+> Even when the log is trimmed, your implemention still needs to properly send the term and index of the entry prior to new entries in `AppendEntries` RPCs; this may require saving and referencing the latest snapshot's `lastIncludedTerm/lastIncludedIndex` (consider whether this should be persisted).
+
+即使日志被切掉了，leader 仍然需要在 `AppendEntries` RPC 中正确发送新条目之前条目（prevLog）的 term 和 index； 这可能需要保存和引用最新快照的 `lastIncludedTerm/lastIncludedIndex`。
+
+**注意点**
+
+- 每个服务器独立拍摄快照时（或者是收到 ISS RPC 时），应确保 `rf.lastIncludedIndex <= rf.lastApplied <= rf.commitIndex`，即快照中的日志必须是已应用的，这是因为
+
+  - 每个服务器独立拍摄快照，仅覆盖其日志中**已提交**的条目。 
+
+  - `lastIncludedIndex`：快照替换的日志中最后一个条目的索引（**状态机应用的最后一个条目**）
+
+- 不要实施图 13 的 `offset` 机制来拆分快照
+- `rf.peers[target].Call("Raft.InstallSnapshot", &args, &reply)` 不要放进临界区，测试程序可能会让他阻塞很久，导致奇怪的后果
